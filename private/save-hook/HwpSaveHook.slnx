@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="core/HwpSaveHook.Core.csproj" />
+  <Project Path="launcher/HwpSaveHook.Launcher.csproj" />
+  <Project Path="launcher.tests/HwpSaveHook.Launcher.Tests.csproj" />
+  <Project Path="gui/HwpSaveHook.Gui.csproj" />
+</Solution>

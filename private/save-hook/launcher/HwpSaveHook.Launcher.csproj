@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    HWP 저장 형식 유지 런처 CLI.
+    로컬 HwpSaveHook 솔루션, WPF UI 및 CLI에서 사용한다.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RuntimeIdentifiers>win-x64;win-x86</RuntimeIdentifiers>
+    <AssemblyName>hwp-save-hook</AssemblyName>
+    <RootNamespace>HwpSaveHook.Launcher</RootNamespace>
+    <!-- 실험용: 릴리스 패키징 스크립트가 글롭으로 집어가지 않도록 표식. -->
+    <IsExperimentalSaveHook>true</IsExperimentalSaveHook>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../core/HwpSaveHook.Core.csproj" />
+  </ItemGroup>
+
+</Project>

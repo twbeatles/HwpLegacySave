@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>HwpSaveHook</AssemblyName>
+    <RootNamespace>HwpSaveHook.Gui</RootNamespace>
+  </PropertyGroup>
+  <!-- 배포용 EXE에 빌드 PC의 PDB 경로가 들어가지 않게 한다. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../core/*.cs" Link="Core/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

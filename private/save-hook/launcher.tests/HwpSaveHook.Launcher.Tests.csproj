@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 오프라인 자체 테스트(외부 테스트 프레임워크 불필요). exit 0 = 통과. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RuntimeIdentifiers>win-x64;win-x86</RuntimeIdentifiers>
+    <AssemblyName>hwp-save-hook-tests</AssemblyName>
+    <RootNamespace>HwpSaveHook.Launcher.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../core/HwpSaveHook.Core.csproj" />
+  </ItemGroup>
+
+</Project>

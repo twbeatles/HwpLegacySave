@@ -1,0 +1,17 @@
+/.codegraph/
+/legacy/
+/docs/private/
+/private/*
+!/private/save-hook/
+/private/save-hook/dist/
+**/bin/
+**/obj/
+.vs/
+TestResults/
+__pycache__/
+*.log
+*.pyc
+*.pml
+*.dmp
+*.gpr
+*.rep/

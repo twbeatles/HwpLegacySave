@@ -1,0 +1,4 @@
+LIBRARY HwpSaveHookProfiler
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
