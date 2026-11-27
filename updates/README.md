@@ -26,7 +26,7 @@ expires_at=<UTC ISO-8601>
 ```powershell
 $env:HWPSAVEHOOK_UPDATE_PRIVATE_KEY = Get-Content <개인키 파일>
 dotnet private/save-hook/launcher/bin/Release/net10.0-windows/win-x64/hwp-save-hook.dll update-sign `
-  --version 1.2.0 --artifact HwpSaveHook-win-x64.zip `
-  --url https://github.com/twbeatles/HwpLegacySave/releases/download/v1.2.0/HwpSaveHook-win-x64.zip `
+  --version 1.2.1 --artifact HwpSaveHook-win-x64.zip `
+  --url https://github.com/twbeatles/HwpLegacySave/releases/download/v1.2.1/HwpSaveHook-win-x64.zip `
   --out updates/latest.json
 ```

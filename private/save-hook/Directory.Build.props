@@ -1,7 +1,7 @@
 <Project>
   <!-- 런처·CLI·테스트가 같은 제품 버전을 쓴다. 릴리스 태그 vX.Y.Z와 일치해야 한다. -->
   <PropertyGroup>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
     <Product>HwpSaveHook</Product>
   </PropertyGroup>
 </Project>
