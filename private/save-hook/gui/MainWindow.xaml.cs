@@ -78,8 +78,11 @@ public partial class MainWindow : Window
             _plan = null;
             HwpPath.Text = "";
             BuildStatus.Text = "";
+            int others = 0;
             var (plan, manual) = await HwpInstallations.InspectWithTimeoutAsync(token =>
             {
+                // 여러 버전이 설치된 PC에서 다른 설치본이 있음을 알린다.
+                others = Math.Max(0, HwpInstallations.FindAll(token).Count - 1);
                 string? path = restoreSelection ? ReadSelectedPath(token)
                     : selectedPath is not null ? HwpInstallations.FindPreferred(selectedPath, token) : null;
                 bool isManual = path is not null;
@@ -91,6 +94,10 @@ public partial class MainWindow : Window
             HwpPath.Text = _plan?.HwpPath ?? "";
             string buildStatus = DescribeBuild(_plan);
             BuildStatus.Text = _plan is null ? buildStatus : $"{(manual ? "직접 지정" : "자동 선택")} · {buildStatus}";
+            if (_plan is not null && others > 0)
+            {
+                BuildStatus.Text += $"\n이 PC에서 한글 설치본 {others}개를 더 찾았습니다. 다른 버전을 쓰려면 찾아보기로 선택하세요.";
+            }
             ActivityStatus.Text = _plan is null
                 ? "찾아보기에서 설치 폴더의 Hwp.exe를 선택하세요."
                 : "실행 중인 한글이 있으면 문서를 저장하고 종료한 뒤 이 창에서 열어 주세요.";
@@ -117,6 +124,7 @@ public partial class MainWindow : Window
             "compatible-needs-opt-in" => $"{label} · 검증되지 않은 빌드입니다. 구조가 같아 아래 '검증되지 않은 한글 버전에도 시도'를 켜면 적용할 수 있습니다.",
             "native-build-unsupported" => $"{label} · 이 버전의 Hwp.exe는 .NET 기반이 아니어서 이 방식으로 바꿀 수 없습니다. OFF로 일반 실행하세요.",
             "target-not-found" => $"{label} · 저장 형식 변환 코드를 찾지 못해 지원하지 않습니다. OFF로 일반 실행하세요.",
+            "target-semantics-differ" => $"{label} · 저장 형식 변환 코드의 동작이 검증 빌드와 달라 적용하지 않습니다. OFF로 일반 실행하세요.",
             "profiler-missing" => "프로파일러 DLL이 없습니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
             "build-hash-mismatch" => "다른 한글 빌드입니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
             "hwp-unreadable" => "한글 실행 파일을 읽을 수 없습니다.",

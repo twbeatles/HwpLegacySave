@@ -33,7 +33,18 @@ public sealed record HwpBuildInfo(
     int? TargetToken,
     string? Error)
 {
-    public bool HasCompatibleTarget => Kind == HwpBuildKind.Managed && IsX86 && TargetToken is not null;
+    /// <summary>대상 메서드 본문이 호출하는 메서드 이름(중복 제거, 등장 순서).</summary>
+    public IReadOnlyList<string> TargetCalls { get; init; } = [];
+
+    /// <summary>
+    /// 메서드 본문이 한글 2022와 같은 의미(에디션 조건에서만 경로를 HWPX로 바꿈)로 보이는지.
+    /// 에디션 판정(IsGovernmentProduct 또는 IsEducationProduct)과 GetUniqueHwpxPath 호출을 모두 요구한다.
+    /// </summary>
+    public bool TargetSemanticsMatch => HwpBuildInspector.MatchesSemantics(TargetCalls);
+
+    public bool HasTargetMethod => Kind == HwpBuildKind.Managed && IsX86 && TargetToken is not null;
+
+    public bool HasCompatibleTarget => HasTargetMethod && TargetSemanticsMatch;
 }
 
 /// <summary>
@@ -50,6 +61,14 @@ public static class HwpBuildInspector
     internal static readonly byte[] TargetSignature = [0x20, 0x02, 0x02, 0x10, 0x0E, 0x10, 0x0E];
 
     private const long MaxImageBytes = 512L * 1024 * 1024;
+
+    /// <summary>
+    /// IL 지문. 한글 2022 교육기관용의 ConvertToHwpxPath는 에디션을 확인한 뒤에만 고유한 .hwpx 경로를 만든다.
+    /// 이 호출이 없으면 반환값의 의미가 달라졌을 수 있어 false 반환을 적용하지 않는다.
+    /// </summary>
+    internal static bool MatchesSemantics(IReadOnlyCollection<string> calls) =>
+        (calls.Contains("IsGovernmentProduct") || calls.Contains("IsEducationProduct")) &&
+        calls.Contains("GetUniqueHwpxPath");
 
     public static HwpBuildInfo Inspect(string path)
     {
@@ -222,11 +241,21 @@ public static class HwpBuildInspector
         int fieldRow = 2 + stringIndex + blobIndex;
         int methodRow = 4 + 2 + 2 + stringIndex + blobIndex + Simple(Param);
 
+        const int ParamPtr = 0x07, InterfaceImpl = 0x09, MemberRef = 0x0A;
+        int paramPtrRow = Simple(Param);
+        int paramRow = 2 + 2 + stringIndex;
+        int interfaceImplRow = Simple(TypeDef) + Coded(2, TypeDef, TypeRef, TypeSpec);
+        int memberRefRow = Coded(3, TypeDef, TypeRef, ModuleRef, MethodDef, TypeSpec) + stringIndex + blobIndex;
+
         int moduleTable = rowCursor;
         int typeRefTable = moduleTable + (checked((int)rows[Module]) * moduleRow);
         int typeDefTable = typeRefTable + (checked((int)rows[TypeRef]) * typeRefRow);
         int fieldTable = typeDefTable + (checked((int)rows[TypeDef]) * typeDefRow);
         int methodTable = fieldTable + (checked((int)rows[Field]) * fieldRow);
+        int paramPtrTable = methodTable + (checked((int)rows[MethodDef]) * methodRow);
+        int paramTable = paramPtrTable + (checked((int)rows[ParamPtr]) * paramPtrRow);
+        int interfaceImplTable = paramTable + (checked((int)rows[Param]) * paramRow);
+        int memberRefTable = interfaceImplTable + (checked((int)rows[InterfaceImpl]) * interfaceImplRow);
 
         uint Index(int offset, int size) => size == 2 ? pe.U16(offset) : pe.U32(offset);
         string ReadString(uint index)
@@ -261,7 +290,58 @@ public static class HwpBuildInspector
             }
         }
 
+        // 호출 토큰(MethodDef 0x06 / MemberRef 0x0A)을 메서드 이름으로 바꾼다.
+        string? CalleeName(uint callToken)
+        {
+            uint table = callToken >> 24, row = callToken & 0xFFFFFF;
+            if (row == 0) return null;
+            if (table == MethodDef && row <= rows[MethodDef])
+            {
+                return ReadString(Index(methodTable + checked((int)((row - 1) * methodRow)) + 8, stringIndex));
+            }
+            if (table == MemberRef && row <= rows[MemberRef])
+            {
+                int at = memberRefTable + checked((int)((row - 1) * memberRefRow));
+                return ReadString(Index(at + Coded(3, TypeDef, TypeRef, ModuleRef, MethodDef, TypeSpec), stringIndex));
+            }
+            return null;
+        }
+
+        List<string> CallsOf(uint rva)
+        {
+            var calls = new List<string>();
+            if (rva == 0) return calls;
+            int body = Offset(rva);
+            byte first = pe.Bytes[body];
+            int codeStart, codeSize;
+            if ((first & 0x3) == 0x2)
+            {
+                codeStart = body + 1;
+                codeSize = first >> 2;
+            }
+            else if ((first & 0x3) == 0x3)
+            {
+                codeStart = body + ((pe.Bytes[body + 1] >> 4) * 4);
+                codeSize = checked((int)pe.U32(body + 4));
+            }
+            else
+            {
+                throw new BadImageException("bad-method-header");
+            }
+            if (codeSize > 64 * 1024) throw new BadImageException("method-too-large");
+
+            // call(0x28)·callvirt(0x6F)·newobj(0x73) 뒤의 메서드 토큰만 본다. 이름이 맞아야 하므로 오탐은 판정을 넓히지 않는다.
+            for (int i = codeStart; i + 4 < codeStart + codeSize; i++)
+            {
+                byte op = pe.Bytes[i];
+                if (op is not (0x28 or 0x6F or 0x73)) continue;
+                if (CalleeName(pe.U32(i + 1)) is string name && !calls.Contains(name)) calls.Add(name);
+            }
+            return calls;
+        }
+
         int? token = null;
+        List<string> targetCalls = [];
         int methodListOffset = 4 + (2 * stringIndex) + Coded(2, TypeDef, TypeRef, TypeSpec) + fieldIndex;
         for (uint type = 0; type < rows[TypeDef] && token is null; type++)
         {
@@ -282,11 +362,15 @@ public static class HwpBuildInspector
                 if (ReadString(Index(methodRowOffset + 8, stringIndex)) != TargetMethodName) continue;
                 if (!ReadBlob(Index(methodRowOffset + 8 + stringIndex, blobIndex)).SequenceEqual(TargetSignature)) continue;
                 token = unchecked((int)(0x06000000u | method));
+                targetCalls = CallsOf(pe.U32(methodRowOffset));
                 break;
             }
         }
 
-        return new(HwpBuildKind.Managed, null, null, isX86 && requires32Bit, mvid, runtime, token, null);
+        return new(HwpBuildKind.Managed, null, null, isX86 && requires32Bit, mvid, runtime, token, null)
+        {
+            TargetCalls = targetCalls,
+        };
     }
 
     private sealed class Image(byte[] bytes)

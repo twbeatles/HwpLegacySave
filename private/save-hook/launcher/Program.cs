@@ -35,6 +35,7 @@ internal static class LauncherCli
     private const string Usage =
         "Usage: hwp-save-hook plan|launch [--hwp PATH] [--profiler DLL] [--expected-sha256 HEX] [--clr auto|netfx|core] [--force-no-hook] [--allow-compatible] [-- HWP_ARGS...]\n" +
         "       hwp-save-hook inspect [--hwp PATH]\n" +
+        "       hwp-save-hook list\n" +
         "       hwp-save-hook update-keygen --private-key-out FILE\n" +
         "       hwp-save-hook update-sign --version V --artifact ZIP --url URL --out FILE [--private-key-env NAME] [--expires-in-days N]";
 
@@ -48,6 +49,7 @@ internal static class LauncherCli
 
         string command = args[0];
         if (command is "update-keygen" or "update-sign") return UpdateCommands.Run(command, args[1..]);
+        if (command == "list") return ListInstallations();
         if (command is not ("plan" or "launch" or "inspect"))
         {
             Console.Error.WriteLine(Usage);
@@ -223,6 +225,41 @@ internal static class LauncherCli
         }
     }
 
+    /// <summary>이 PC에서 찾은 한글 설치본을 모두 나열하고, 자동 선택될 설치본을 표시한다.</summary>
+    private static int ListInstallations()
+    {
+        try
+        {
+            var (all, preferred) = HwpInstallations.InspectWithTimeoutAsync(token =>
+                (HwpInstallations.FindAll(token), HwpInstallations.FindPreferred(cancellationToken: token)),
+                TimeSpan.FromSeconds(20)).GetAwaiter().GetResult();
+            var items = new JsonArray();
+            foreach (string path in all)
+            {
+                string? hash = SaveHookLauncher.TryHashFile(path);
+                KnownHwpBuild? known = HwpBuildCatalog.Find(hash);
+                HwpBuildInfo build = HwpBuildInspector.Inspect(path);
+                items.Add(new JsonObject
+                {
+                    ["hwp"] = path,
+                    ["selected"] = string.Equals(path, preferred, StringComparison.OrdinalIgnoreCase),
+                    ["product"] = known?.Product ?? build.ProductName,
+                    ["fileVersion"] = build.FileVersion,
+                    ["verified"] = known is not null,
+                    ["kind"] = build.Kind.ToString().ToLowerInvariant(),
+                    ["compatible"] = build.HasCompatibleTarget,
+                });
+            }
+            WriteJson(new JsonObject { ["count"] = all.Count, ["installations"] = items });
+            return all.Count == 0 ? 3 : 0;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or TimeoutException)
+        {
+            WriteJson(new JsonObject { ["status"] = "inspection-failed", ["error"] = error.Message });
+            return 5;
+        }
+    }
+
     /// <summary>새 한글 빌드를 카탈로그에 추가할 때 필요한 값을 출력한다. 실행 파일은 읽기만 한다.</summary>
     private static int Inspect(string? hwp)
     {
@@ -260,6 +297,8 @@ internal static class LauncherCli
             ["targetMethod"] = $"{HwpBuildInspector.TargetTypeNamespace}.{HwpBuildInspector.TargetTypeName}::{HwpBuildInspector.TargetMethodName}",
             ["targetToken"] = build.TargetToken is int token ? $"0x{token:X8}" : null,
             ["verified"] = known is not null,
+            ["targetCalls"] = new JsonArray(build.TargetCalls.Select(call => (JsonNode?)JsonValue.Create(call)).ToArray()),
+            ["targetSemanticsMatch"] = build.TargetSemanticsMatch,
             ["compatible"] = build.HasCompatibleTarget,
             ["error"] = build.Error,
         });

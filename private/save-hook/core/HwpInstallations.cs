@@ -66,6 +66,14 @@ public static class HwpInstallations
         return ChooseCandidate(Discover(cancellationToken), SaveHookLauncher.DefaultExpectedSha256, cancellationToken);
     }
 
+    /// <summary>이 PC에서 찾은 실행 가능한 Hwp.exe 전체(중복 제거, 탐지 순서).</summary>
+    public static IReadOnlyList<string> FindAll(CancellationToken cancellationToken = default) =>
+        Discover(cancellationToken).Distinct(PathComparer).Where(path =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return IsExecutable(path);
+        }).ToList();
+
     internal static string? ChooseCandidate(IEnumerable<string> candidates, string expectedSha256,
         CancellationToken cancellationToken = default)
     {
@@ -120,22 +128,169 @@ public static class HwpInstallations
 
         foreach (RegistryView view in views)
         {
+            AddHancomRegistry(candidates, RegistryHive.LocalMachine, view, cancellationToken);
+            AddHancomRegistry(candidates, RegistryHive.CurrentUser, view, cancellationToken);
+        }
+
+        foreach (RegistryView view in views)
+        {
             AddInstalledProducts(candidates, RegistryHive.CurrentUser, view, cancellationToken);
             AddInstalledProducts(candidates, RegistryHive.LocalMachine, view, cancellationToken);
         }
+
+        AddRunningHangul(candidates);
 
         var roots = new[] { "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432" }
             .Select(Environment.GetEnvironmentVariable).OfType<string>().ToList();
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (!string.IsNullOrEmpty(local)) roots.Add(Path.Combine(local, "Programs"));
+        // 시스템 드라이브가 아닌 고정 디스크에 설치한 경우(D:\Program Files (x86)\HNC 등). 네트워크·이동식 드라이브는 지연될 수 있어 제외한다.
+        foreach (string drive in FixedDriveRoots())
+        {
+            roots.Add(drive);
+            roots.Add(Path.Combine(drive, "Program Files"));
+            roots.Add(Path.Combine(drive, "Program Files (x86)"));
+        }
         foreach (string root in roots.Distinct(PathComparer))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             AddInstallLocation(candidates, Path.Combine(root, "HNC"), cancellationToken);
             AddInstallLocation(candidates, Path.Combine(root, "Hancom"), cancellationToken);
         }
 
         return candidates;
     }
+
+    /// <summary>
+    /// 한컴오피스 설치 프로그램이 남기는 자체 레지스트리(HNC 키). 버전 번호(100·110·120·130 …)와 관계없이 열거한다.
+    /// - HNC\Hwp\{버전}\Capabilities: ApplicationIcon = "...\Bin\hwp.exe",0
+    /// - HNC\Shared: "Hnc Path{번호}" = 설치 루트
+    /// - HNC\Shared\Install Information\Hwp{번호}: Path = 설치 루트
+    /// - HNC\Shared\Common{버전}: "Common Path" = ...\Bin\
+    /// - HNC\Shared\HncUpdate\HOffice_*: Path = 설치 루트
+    /// </summary>
+    private static void AddHancomRegistry(ICollection<string> candidates, RegistryHive hive, RegistryView view,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using RegistryKey root = RegistryKey.OpenBaseKey(hive, view);
+            using RegistryKey? hnc = root.OpenSubKey(@"Software\HNC");
+            if (hnc is null) return;
+
+            using (RegistryKey? hwp = hnc.OpenSubKey("Hwp"))
+            {
+                foreach (string version in hwp?.GetSubKeyNames() ?? [])
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    using RegistryKey? capabilities = hwp!.OpenSubKey($@"{version}\Capabilities");
+                    AddCandidate(candidates, capabilities?.GetValue("ApplicationIcon") as string);
+                }
+            }
+
+            using RegistryKey? shared = hnc.OpenSubKey("Shared");
+            if (shared is null) return;
+            foreach (string name in shared.GetValueNames())
+            {
+                if (name.StartsWith("Hnc Path", StringComparison.OrdinalIgnoreCase)) AddRoot(shared.GetValue(name) as string);
+            }
+            foreach (string name in shared.GetSubKeyNames())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (name.StartsWith("Common", StringComparison.OrdinalIgnoreCase))
+                {
+                    using RegistryKey? common = shared.OpenSubKey(name);
+                    if (common?.GetValue("Common Path") is string bin && NormalizeAbsolutePath(Clean(bin)) is string binPath)
+                    {
+                        candidates.Add(Path.Combine(binPath, "Hwp.exe"));
+                    }
+                }
+            }
+            AddRootsFrom(shared, "Install Information", key => key.StartsWith("Hwp", StringComparison.OrdinalIgnoreCase) ||
+                                                              key.StartsWith("HOffice", StringComparison.OrdinalIgnoreCase));
+            AddRootsFrom(shared, "HncUpdate", key => key.StartsWith("HOffice", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException) { }
+
+        void AddRootsFrom(RegistryKey shared, string subKey, Func<string, bool> include)
+        {
+            using RegistryKey? parent = shared.OpenSubKey(subKey);
+            foreach (string name in parent?.GetSubKeyNames() ?? [])
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!include(name)) continue;
+                using RegistryKey? entry = parent!.OpenSubKey(name);
+                AddRoot(entry?.GetValue("Path") as string);
+            }
+        }
+
+        void AddRoot(string? value)
+        {
+            if (value is not null && NormalizeAbsolutePath(Clean(value)) is string path)
+            {
+                AddInstallLocation(candidates, path, cancellationToken);
+            }
+        }
+
+        static string Clean(string value) => Environment.ExpandEnvironmentVariables(value).Trim().Trim('"');
+    }
+
+    /// <summary>실행 중인 한글의 실제 경로. 휴대용·비표준 설치도 한글을 한 번 열어 두면 찾을 수 있다.</summary>
+    private static void AddRunningHangul(ICollection<string> candidates)
+    {
+        System.Diagnostics.Process[] processes;
+        try { processes = System.Diagnostics.Process.GetProcessesByName("Hwp"); }
+        catch (InvalidOperationException) { return; }
+        foreach (System.Diagnostics.Process process in processes)
+        {
+            using (process)
+            {
+                if (TryGetProcessPath(process.Id) is string path) candidates.Add(path);
+            }
+        }
+    }
+
+    private static string? TryGetProcessPath(int processId)
+    {
+        const uint queryLimitedInformation = 0x1000;
+        IntPtr handle = OpenProcess(queryLimitedInformation, false, processId);
+        if (handle == IntPtr.Zero) return null;
+        try
+        {
+            var buffer = new System.Text.StringBuilder(1024);
+            int size = buffer.Capacity;
+            return QueryFullProcessImageName(handle, 0, buffer, ref size) ? NormalizeAbsolutePath(buffer.ToString()) : null;
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    private static IEnumerable<string> FixedDriveRoots()
+    {
+        DriveInfo[] drives;
+        try { drives = DriveInfo.GetDrives(); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { yield break; }
+        foreach (DriveInfo drive in drives)
+        {
+            bool ready;
+            try { ready = drive.DriveType == DriveType.Fixed && drive.IsReady; }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { ready = false; }
+            if (ready) yield return drive.RootDirectory.FullName;
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, int processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(IntPtr process, int flags, System.Text.StringBuilder name, ref int size);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     private static string? ReadRegistry(RegistryHive hive, RegistryView view, string subKey)
     {

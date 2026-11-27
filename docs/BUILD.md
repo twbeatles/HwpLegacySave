@@ -50,7 +50,13 @@ GUI의 업데이트 흐름은 다음과 같습니다.
 
 ## UI에서 확인할 항목
 
-- 처음 열 때 Windows의 사용자별·시스템 설치 등록, 한글 문서 연결과 기본 설치 위치에서 `Hwp.exe`를 찾습니다. 여러 버전이 있으면 검증된 빌드, 저장 형식 변환 코드 구조가 같은 빌드, 첫 실행 파일 순으로 고릅니다.
+- 처음 열 때 다음 위치에서 `Hwp.exe`를 찾습니다.
+  - App Paths, COM(`HWPFrame.HwpObject`) 등록, `.hwp` 문서 연결
+  - 한컴 설치 프로그램의 `HNC` 레지스트리: `Hwp\{버전}\Capabilities`, `Shared`의 `Hnc Path*`, `Install Information\Hwp*`, `Common*`, `HncUpdate\HOffice_*`
+  - 프로그램 추가/제거 목록, 실행 중인 한글 프로세스
+  - 모든 고정 디스크의 `HNC`·`Hancom`, `Program Files`, `Program Files (x86)` 아래 `Office*\HOffice*\Bin`
+
+  버전 번호를 고정하지 않으므로 2018(`HOffice100`)부터 2024(`HOffice130`)와 이후 버전도 같은 방식으로 찾습니다. 다른 설치본이 더 있으면 화면에 개수를 알려 줍니다. 여러 버전이 있으면 검증된 빌드, 저장 형식 변환 코드 구조가 같은 빌드, 첫 실행 파일 순으로 고릅니다.
 - 검증 목록에 없는 빌드는 `Hwp.exe`의 .NET 메타데이터를 읽어 판정합니다. **검증되지 않은 한글 버전에도 시도**(기본 OFF, `%LOCALAPPDATA%\HwpSaveHook\compatible-mode.txt`)를 켜야 compatible 모드로 적용합니다. 자세한 판정은 [버전별 호환성](VERSION-COMPATIBILITY.md)을 참고하세요.
 - **찾아보기…**로 지정한 경로는 같은 Windows 사용자의 다음 실행에도 사용됩니다. 경로가 없어지거나 **다시 찾기**를 누르면 자동 탐지합니다.
 - **HWP 저장 유지** 토글을 ON으로 두면 지원 해시와 DLL이 확인된 경우에 **한글 열기**를 사용할 수 있습니다. OFF로 바꾸면 일반 실행합니다.
@@ -70,7 +76,7 @@ dotnet run --project private/save-hook/launcher -- plan --clr netfx --profiler p
 
 설치 정보가 바뀌었으면 `--hwp PATH`로 실행 파일을 지정하세요. 검증되지 않은 빌드에 시도하려면 `--allow-compatible`을 붙입니다. 계획 JSON의 `build`, `targetMode`, `targetToken`으로 판정 결과를 확인할 수 있습니다.
 
-새 한글 빌드의 지원 여부는 `inspect`로 확인합니다. 실행 파일은 읽기만 합니다.
+`list`는 이 PC에서 찾은 설치본 전체와 자동 선택 결과, 검증·호환 여부를 JSON으로 출력합니다. 새 한글 빌드의 지원 여부는 `inspect`로 확인합니다. `targetCalls`와 `targetSemanticsMatch`가 IL 지문 결과입니다. 두 명령 모두 실행 파일을 읽기만 합니다.
 
 ```powershell
 dotnet run --project private/save-hook/launcher -- inspect --hwp "C:\Program Files (x86)\HNC\Office 2024\HOffice130\Bin\Hwp.exe"

@@ -493,6 +493,9 @@ if (args is ["--cli", string dotnet, string cli])
         HwpBuildInfo real = HwpBuildInspector.Inspect(installed);
         Check("inspect: installed Hangul 2022 matches the catalog MVID and token",
             real.HasCompatibleTarget && real.Mvid == verified.Mvid && real.TargetToken == verified.TargetToken);
+        Check("inspect: installed Hangul 2022 target body matches the IL fingerprint",
+            real.TargetSemanticsMatch && real.TargetCalls.Contains("IsGovernmentProduct") &&
+            real.TargetCalls.Contains("IsEducationProduct") && real.TargetCalls.Contains("GetUniqueHwpxPath"));
         LaunchPlan realPlan = SaveHookLauncher.CreatePlan(installed, Environment.ProcessPath!, SaveHookLauncher.ProfilerClsid,
             ClrKind.NetFramework, SaveHookLauncher.DefaultExpectedSha256);
         Check("plan: verified build uses verified mode and catalog token",
@@ -505,7 +508,10 @@ if (args is ["--cli", string dotnet, string cli])
         Console.WriteLine("  SKIP  inspect: Hangul 2022 12.0.0.4645 is not installed");
     }
 
-    var compatible = new HwpBuildInfo(HwpBuildKind.Managed, "13.0.0.1", "한글 2024", true, Guid.NewGuid(), "v4.0.30319", 0x06000250, null);
+    var compatible = new HwpBuildInfo(HwpBuildKind.Managed, "13.0.0.1", "한글 2024", true, Guid.NewGuid(), "v4.0.30319", 0x06000250, null)
+    {
+        TargetCalls = ["IsNullOrEmpty", "IsEducationProduct", "GetUniqueHwpxPath"],
+    };
     Check("structure: compatible build needs opt-in",
         SaveHookLauncher.EvaluateStructure(compatible, "AA", allowCompatible: false) is
             { Decision: HookDecision.RunWithoutHook, Reason: "compatible-needs-opt-in" });
@@ -518,6 +524,12 @@ if (args is ["--cli", string dotnet, string cli])
     Check("structure: managed build without the method is not hooked",
         SaveHookLauncher.EvaluateStructure(compatible with { TargetToken = null }, "AA", true) is
             { Reason: "target-not-found" });
+    Check("structure: same signature without edition check and HWPX path is not hooked",
+        SaveHookLauncher.EvaluateStructure(compatible with { TargetCalls = ["IsNullOrEmpty", "EndsWith"] }, "AA", true) is
+            { Decision: HookDecision.RunWithoutHook, Reason: "target-semantics-differ" });
+    Check("structure: government edition check also satisfies the fingerprint",
+        SaveHookLauncher.EvaluateStructure(compatible with { TargetCalls = ["IsGovernmentProduct", "GetUniqueHwpxPath"] }, "AA", true) is
+            { Reason: "compatible-signature" });
     Check("structure: AnyCPU build is not hooked by the x86 profiler",
         SaveHookLauncher.EvaluateStructure(compatible with { IsX86 = false }, "AA", true) is
             { Reason: "target-not-found" });

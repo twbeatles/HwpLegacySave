@@ -281,9 +281,14 @@ public static class SaveHookLauncher
         {
             return new(HookDecision.RunWithoutHook, "native-build-unsupported", actual);
         }
-        if (!build.HasCompatibleTarget)
+        if (!build.HasTargetMethod)
         {
             return new(HookDecision.RunWithoutHook, "target-not-found", actual);
+        }
+        if (!build.TargetSemanticsMatch)
+        {
+            // 이름·시그니처는 같지만 본문이 에디션 판정·HWPX 경로 생성을 하지 않는다. false 반환의 의미를 보장할 수 없다.
+            return new(HookDecision.RunWithoutHook, "target-semantics-differ", actual);
         }
         if (allowCompatible)
         {
