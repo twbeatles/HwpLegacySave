@@ -1,8 +1,8 @@
 {
-  "version": "1.2.1",
-  "artifact_url": "https://github.com/twbeatles/HwpLegacySave/releases/download/v1.2.1/HwpSaveHook-win-x64.zip",
-  "sha256": "7d33cd41fab1c4427dd6868920325e82440bc30b6e685468ed9464ccbe986bdb",
-  "size": 146721,
-  "expires_at": "2027-11-27T04:08:17Z",
-  "signature": "100DwwSKzU16Xspu/dxc6jwxEJH\u002BspobzlnrOkhrUjAhdB9Z85e2LSVggtXxHb/h4HdGfC1DDF09AGId2LFbYg=="
+  "version": "1.2.2",
+  "artifact_url": "https://github.com/twbeatles/HwpLegacySave/releases/download/v1.2.2/HwpSaveHook-win-x64.zip",
+  "sha256": "71e493fce3d440bc642088bbf4834e1d146c33989112d7abe50fbf8ef2c74d15",
+  "size": 153077,
+  "expires_at": "2027-11-27T06:24:05Z",
+  "signature": "l/T0ruBo4\u002BGW2OEScRa\u002B\u002Bu2S9dwCGXHoBRlrsC\u002BIA8Q\u002B3NYT5C2Veknp/a\u002B7XRPKnTJkbDuWqtTKzE9MOcJGpQ=="
 }
