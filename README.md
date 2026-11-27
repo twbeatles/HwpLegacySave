@@ -161,6 +161,7 @@
 - 📐 [시스템 설계 및 동작 원리 (Design Spec)](docs/superpowers/specs/2026-11-26-hwp-save-hook-design.md)
 - 🧪 [검증 및 실기 테스트 보고서](docs/superpowers/specs/2026-11-26-hwp-save-hook-rejit-handoff.md)
 - 🔍 [프로젝트 감사 보고서 (Project Audit)](PROJECT_AUDIT.md)
+- 🔍 [후속 감사 보고서: 미감사 범위 (Follow-up Audit)](PROJECT_AUDIT_2.md)
 
 ---
 

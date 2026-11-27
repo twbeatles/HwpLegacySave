@@ -13,11 +13,25 @@ $binDir = Join-Path $here 'bin'
 
 # vcvars x86 흡수 (build.ps1과 동일 방식)
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsPath = & $vswhere -latest -products * -property installationPath
+if (-not (Test-Path $vswhere)) { throw "vswhere.exe를 찾을 수 없습니다: $vswhere" }
+
+$vsPath = & $vswhere -latest -products * `
+    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -property installationPath
+if (-not $vsPath) {
+    # 개별 컴포넌트 지정이 안 먹는 설치에서는 일단 최신 경로라도 받아본다.
+    $vsPath = & $vswhere -latest -products * -property installationPath
+}
+if (-not $vsPath) { throw "MSVC(C++ 빌드 도구)가 설치되어 있지 않습니다." }
+
 $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvarsall.bat'
+if (-not (Test-Path $vcvars)) { throw "vcvarsall.bat를 찾을 수 없습니다: $vcvars" }
+
 $envDump = & "${env:ComSpec}" /c "`"$vcvars`" x86 >nul 2>&1 && set"
 foreach ($line in $envDump) { if ($line -match '^(.*?)=(.*)$') { Set-Item -Path ("env:" + $matches[1]) -Value $matches[2] } }
-$cl = (Get-Command cl.exe).Source
+$cl = (Get-Command cl.exe -ErrorAction SilentlyContinue)
+if (-not $cl) { throw "cl.exe를 PATH에서 찾지 못했습니다(vcvars 설정 실패)." }
+$cl = $cl.Source
 
 New-Item -ItemType Directory -Force -Path $objDir, $binDir | Out-Null
 

@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security;
 
 namespace HwpSaveHook.Launcher;
 
@@ -29,6 +31,44 @@ public static class HangulProcesses
 {
     public const string ProfilerModuleName = "HwpSaveHookProfiler.dll";
 
+    /// <summary>
+    /// 한글 실행 파일로 보이는지 버전 정보로 확인한다. 같은 이름의 다른 프로그램이
+    /// 실행 중 검사를 오작동시키는 것을 막는다. 알 수 없으면 한글로 간주한다(fail-safe).
+    /// </summary>
+    internal static bool LooksLikeHangulExecutable(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return true;
+        try
+        {
+            FileVersionInfo version = FileVersionInfo.GetVersionInfo(path);
+            string identity = $"{version.CompanyName} {version.ProductName} {version.FileDescription}";
+            if (string.IsNullOrWhiteSpace(identity)) return true;
+            return HangulIdentityKeywords.Any(keyword =>
+                identity.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException
+                                      or ArgumentException or FileNotFoundException or DirectoryNotFoundException)
+        {
+            return true;
+        }
+    }
+
+    private static readonly string[] HangulIdentityKeywords =
+        ["Hancom", "HNC", "Haansoft", "한컴", "한글", "Hwp"];
+
+    private static string? TryGetMainModulePath(Process instance)
+    {
+        try { return instance.MainModule?.FileName; }
+        catch (Exception error) when (error is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>실행 중인 프로세스가 한글로 보이면 true. 알 수 없으면 true(fail-safe).</summary>
+    internal static bool LooksLikeHangulInstance(Process instance) =>
+        LooksLikeHangulExecutable(TryGetMainModulePath(instance));
+
     public static RunningHangulState GetState() => GetState(ProfilerModuleName);
 
     internal static RunningHangulState GetState(string profilerModuleName)
@@ -45,6 +85,8 @@ public static class HangulProcesses
                 try
                 {
                     if (instance.SessionId != session || instance.HasExited) continue;
+                    // 같은 이름의 다른 프로그램은 한글 상태 판정에서 뺀다.
+                    if (!LooksLikeHangulExecutable(TryGetMainModulePath(instance))) continue;
                 }
                 catch (Exception error) when (error is InvalidOperationException or Win32Exception)
                 {

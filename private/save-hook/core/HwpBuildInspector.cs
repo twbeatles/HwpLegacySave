@@ -124,8 +124,10 @@ public static class HwpBuildInspector
         {
             return InspectCore(new Image(image));
         }
-        catch (Exception error) when (error is BadImageException or ArgumentOutOfRangeException or IndexOutOfRangeException or OverflowException)
+        catch (Exception error) when (error is BadImageException or ArgumentException or IndexOutOfRangeException or OverflowException)
         {
+            // ArgumentException은 범위를 벗어난 Buffer.BlockCopy 등에서 나온다.
+            // ArgumentOutOfRangeException은 ArgumentException에 포함된다.
             return new(HwpBuildKind.Unreadable, null, null, false, null, null, null,
                 error is BadImageException ? error.Message : "invalid-image");
         }
@@ -268,11 +270,17 @@ public static class HwpBuildInspector
         byte[] ReadBlob(uint index)
         {
             int at = blob + checked((int)index);
+            if (at < 0 || at >= pe.Bytes.Length) throw new BadImageException("blob-out-of-range");
             byte first = pe.Bytes[at];
+            // 길이 헤더(1·2·4바이트)가 이미지 안에 다 있어야 한다.
+            int header = (first & 0x80) == 0 ? 1 : (first & 0xC0) == 0x80 ? 2 : 4;
+            if (at + header > pe.Bytes.Length) throw new BadImageException("blob-out-of-range");
             int length;
-            if ((first & 0x80) == 0) { length = first; at += 1; }
-            else if ((first & 0xC0) == 0x80) { length = ((first & 0x3F) << 8) | pe.Bytes[at + 1]; at += 2; }
+            if (header == 1) { length = first; at += 1; }
+            else if (header == 2) { length = ((first & 0x3F) << 8) | pe.Bytes[at + 1]; at += 2; }
             else { length = ((first & 0x1F) << 24) | (pe.Bytes[at + 1] << 16) | (pe.Bytes[at + 2] << 8) | pe.Bytes[at + 3]; at += 4; }
+            // 거짓 길이 선언으로 남은 이미지를 넘어 읽거나 과도하게 할당하지 않는다.
+            if (length < 0 || length > pe.Bytes.Length - at) throw new BadImageException("blob-out-of-range");
             var value = new byte[length];
             Buffer.BlockCopy(pe.Bytes, at, value, 0, length);
             return value;

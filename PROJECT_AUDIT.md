@@ -1,177 +1,225 @@
 # Project Audit
 
-2026-11-26 기준 `main`의 `dd78848`을 감사했다. 대상은 한글 2022 교육기관용 `12.0.0.4645` x86을 지원하는 Windows x64 런처다.
+감사 기준일: 2026-11-27. 대상 커밋: `42f7afa` (DESCRIPTION: v1.2.2 매니페스트 발행 시점).
+코드는 수정하지 않고 읽기·분석만 수행했다.
 
 ## 1. Executive Summary
 
-**전체 위험도는 Medium이다.** 격리 복사본에서 x86 프로파일러, x64 GUI와 CLI를 빌드했고 기존 테스트 24개가 모두 통과했다. 주요 위험은 프로세스 시작과 ReJIT 적용 사이의 상태 전이, 실패 진단, Windows 빌드 경로 처리에 있다.
+**전체 상태는 양호하고 전체 위험도는 Medium이다.**
+데이터를 직접 쓰는 사용자 문서 경로가 없고(저장은 한글이 담당), 실행 게이트·서명 업데이트·레지스트리 복원 등
+핵심 안전장치가 코드로 확인된다. 2026-11-26 감사 이후 지적됐던 항목(프로세스 경합, ReJIT 상태 구분,
+네이티브 로그 버퍼, 공백 경로 빌드, CLI 빈 값 검증)은 현재 코드에서 해소된 것으로 확인된다.
+다만 High/Critical에 해당하는 잔여 문제는 없고, 아래 3건이 남는다.
 
-1. CLI는 기존 한글 프로세스를 검사하지 않는다. GUI도 검사와 시작 사이에 다른 런처와 경합할 수 있다.
-2. UI는 ReJIT 요청 성공을 준비 완료로 표시한다. 실제 적용 과정에서 발생하는 후속 실패는 UI에 반영되지 않는다.
-3. 네이티브 로그 경로의 폴백이 Win32의 버퍼 필요 크기를 실제 문자열 길이로 사용한다.
-4. 공백이 있는 체크아웃에서는 기본 빌드가 실패하고, 빈 프로파일러 경로는 CLI의 처리되지 않은 예외로 이어진다.
+1. 변조·손상된 `Hwp.exe`를 분석할 때 파서가 `ArgumentException`을 밖으로 흘려 CLI `list`가 비정상 종료한다 (Likely / Medium).
+2. 실행 중인 한글 판정이 프로세스 이름(`Hwp`)에만 의존해 동명 프로세스에 오작동한다 (Likely / Low).
+3. 복원에 실패한 업데이트의 수동 복원용 백업을 다음 업데이트가 조용히 지운다 (Likely / Low).
 
-문서 손상이나 유실은 확인되지 않았다. 런처는 설치 파일을 읽고 자식 프로세스를 시작하며, 문서 저장은 한글이 맡는다. 적용 실패 시 예상과 다른 형식으로 저장될 수 있다. 우선 실행 경계를 공통화하고, 네이티브 로그 검증과 ReJIT 상태 표시를 보강해야 한다.
+**데이터 손상/유실 가능성: 사용자 문서에 대해서는 없음.**
+런처는 설치 파일을 읽고 자식 프로세스를 시작할 뿐 문서에 쓰지 않는다.
+프로파일러가 바꾸는 것은 `ConvertToHwpxPath`의 반환값뿐이라 최악의 경우는 HWPX로 저장되는 형식 어긋남이다.
+업데이트 교체 실패 시에는 smoke 검사+롤백이 있고, 수동 복원용 백업이 남는다(ISSUE-003의 보관 흠결 제외).
+
+**가장 먼저 수정할 영역:** `HwpBuildInspector` 파서 강건화와 그 호출자(`list`)의 예외 처리(ISSUE-001).
+공유 파서라 한 곳을 고치면 전 경로가 보호된다.
 
 ## 2. Project Understanding
 
-[README](README.md), [빌드 안내](docs/BUILD.md), [설계](docs/superpowers/specs/2026-11-26-hwp-save-hook-design.md), [기존 검증 기록](docs/superpowers/specs/2026-11-26-hwp-save-hook-rejit-handoff.md), [빌드 스크립트](Build-Local.ps1), [솔루션](private/save-hook/HwpSaveHook.slnx)과 프로젝트 설정을 확인했다. 체크아웃에는 `CLAUDE.md`와 `AGENTS.md`가 없었다. 세션에서 제공된 CodeGraph 우선 사용 지침을 적용했다.
+[README](README.md), [빌드 안내](docs/BUILD.md), [버전별 호환성](docs/VERSION-COMPATIBILITY.md),
+[설계](docs/superpowers/specs/2026-11-26-hwp-save-hook-design.md),
+[검증 기록](docs/superpowers/specs/2026-11-26-hwp-save-hook-rejit-handoff.md),
+[빌드 스크립트](Build-Local.ps1), [업데이트 매니페스트](updates/latest.json)를 확인했다.
+체크아웃에 `CLAUDE.md`와 `AGENTS.md`는 없고, 이를 참조하는 문서도 없다(검색으로 확인).
 
-| 진입점 | 입력에서 결과까지 |
-|---|---|
-| x64 WPF `App.xaml` → `MainWindow.Window_Loaded` | 사용자 설정 → `Scan` → 수동 경로 복원 또는 설치 등록·기본 위치 조회 → PE 확인과 SHA-256 우선 선택 → 경로·지원 상태 표시 |
-| GUI 토글·찾아보기·다시 찾기 | `ModeChanged` 또는 `Scan` → 사용자 모드·경로 파일을 임시 파일과 교체하거나 자동 탐지로 복귀 → 다음 GUI 시작 시 복원 |
-| GUI `Launch_Click` | `Start` → 경로 재검사와 `CreatePlan` → `EnsureHangulClosed` → 공용 `Launch` → 자식 프로세스와 로그 → 실행 상태 표시 |
-| CLI `LauncherCli.Run` | 인자 파싱 → 설치 탐지와 `CreatePlan` → `plan`은 계획 JSON, `launch`는 `Launch` → PID 또는 오류 반환 |
-| x86 프로파일러 `DllGetClassObject` | CLR 초기화 → `ModuleLoadFinished`와 `VerifyTarget` → 전용 스레드의 ReJIT 요청 → 대상 IL 설치와 컴파일 → 한글 저장 및 로그 |
-| `tools/inspect_format.py` | 파일 경로 → CFB 또는 ZIP 읽기 → 파일 헤더·필수 항목 확인 → HWP5 또는 HWPX 형식 후보와 종료 코드 반환 |
-
-공유 상태에는 GUI 인스턴스의 `_plan`, `_useHook`, `_busy`, 사용자별 `save-mode.txt`와 `hwp-path.txt`, 자식별 로그와 프로파일러의 원자적 모듈 ID가 있다. GUI는 .NET Framework 4.8, CLI·테스트는 .NET 10, 네이티브 DLL은 MSVC x86과 CLR 프로파일링 API를 사용한다. 설치 탐지는 레지스트리를 읽는다. 빌드에는 NuGet 복원이 있지만, 저장 런타임의 자체 네트워크 API, DB, 트랜잭션 및 마이그레이션은 없다.
+- **프로젝트 목적:** 한글 2022 교육기관용 등에서 `.hwp` 저장이 `.hwpx`로 강제 전환되는 것을,
+  설치 파일을 건드리지 않고 CLR 프로파일러 환경변수를 건 자식 프로세스에서만 우회하는 Windows 런처.
+- **주요 entrypoint**
+  - x64 WPF GUI: [App.xaml.cs](private/save-hook/gui/App.xaml.cs) → [MainWindow.xaml.cs](private/save-hook/gui/MainWindow.xaml.cs)
+  - 투명 실행(`--open`, 더블클릭·바로가기): `App.RunTransparentAsync`
+  - CLI: [launcher/Program.cs](private/save-hook/launcher/Program.cs) (`plan`·`launch`·`inspect`·`list`·`update-keygen`·`update-sign`)
+  - x86 네이티브 프로파일러: [profiler/HwpSaveHookProfiler.cpp](private/save-hook/profiler/HwpSaveHookProfiler.cpp) (+판정표 [Target.h](private/save-hook/profiler/Target.h))
+  - 형식 검사 도구: [tools/inspect_format.py](tools/inspect_format.py) (수동 개발 도구, 제품 미포함)
+- **핵심 모듈:** [SaveHookLauncher.cs](private/save-hook/core/SaveHookLauncher.cs) (게이트·계획·실행),
+  [HwpInstallations.cs](private/save-hook/core/HwpInstallations.cs) (탐지·8초 타임아웃),
+  [HwpBuildInspector.cs](private/save-hook/core/HwpBuildInspector.cs) (PE·IL 지문),
+  [HangulProcesses.cs](private/save-hook/core/HangulProcesses.cs) (실행 상태),
+  [WindowsIntegration.cs](private/save-hook/core/WindowsIntegration.cs) (바로가기·파일 연결·백업),
+  [SaveHookSettings.cs](private/save-hook/core/SaveHookSettings.cs) (원자적 설정 기록),
+  [RejitStatus.cs](private/save-hook/core/RejitStatus.cs) (로그 기반 상태),
+  [UpdateInstaller.cs](private/save-hook/core/UpdateInstaller.cs) + [UpdateManifest.cs](private/save-hook/core/UpdateManifest.cs) (서명 업데이트).
+- **데이터 저장 방식:** DB 없음. `%LOCALAPPDATA%\HwpSaveHook\`에 `save-mode.txt`·`hwp-path.txt`·
+  `hwp-path-detected.txt`·`compatible-mode.txt`·`assoc-backup.txt`·`logs\`·`updates\`를 둔다.
+  설정 기록은 임시 파일 후 교체(`File.Replace`/`Move`) 방식이다.
+- **외부 의존성:** .NET 10 SDK(CLI·Core·테스트), .NET Framework 4.8(GUI, Core 소스 직접 컴파일),
+  MSVC x86(프로파일러), Windows 레지스트리(HKCU/HKLM 읽기, HKCU 쓰기), GitHub 릴리스·`raw.githubusercontent.com`(업데이트 확인).
+  런타임 DB·트랜잭션·마이그레이션은 없다.
+- **핵심 실행 흐름:**
+  - GUI 열기: `App_Startup → Window_Loaded → Scan → FindPreferred → CreatePlan → DescribeBuild·상태 표시`
+  - GUI 시작: `Launch_Click → Start(재검사·CreatePlan) → Launch(뮤텍스+실행중 검사+Process.Start) → WaitAsync → 요청접수/적용됨/실패 표시(+백그라운드 ObserveCompilation)`
+  - CLI: `Run → FindPreferred → CreatePlan → plan(JSON 출력) | launch(Launch+WaitAsync → launched/profiling-unconfirmed)`
+  - 투명 실행: `RunTransparentAsync(저장→탐지 캐시→전체 탐지 → CreatePlan → 미적용/미훅 경고 → LaunchTransparent(뮤텍스 직렬화, 실행중 검사 없음))`
+  - 프로파일러: `Initialize(실행파일명 게이트·SetEventMask2) → ModuleLoadFinished/VerifyTarget(MVID·토큰 또는 compatible 토큰) → 워커 RequestReJIT → GetReJITParameters(ldc.i4.0;ret) → 컴파일/오류 콜백 → ReJITState 로그 → RejitLog.ReadStatus/WaitAsync`
+  - 업데이트: `Check(HTTPS 다운로드+서명·버전·만료 검증) → Stage(크기·해시+ZIP 탈출·필수파일 검사) → LaunchHelper(복사 후 종료) → Apply(부모 대기·한글 실행중 재확인·ReplaceFiles+smoke·실패 시 Rollback) → WriteResult → 다음 시작 시 ConsumeResult`
 
 ## 3. Audit Coverage & Limitations
 
-- **CodeGraph MCP**에서 GUI 시작 → 설정 복원 → 설치 선택 → 해시 계산, `CreatePlan`과 `Launch`의 GUI·CLI 호출자, `WaitForRejitRequest`의 GUI 호출자, 네이티브 모듈 검증과 IL 설치를 확인했다. XAML 이벤트, PowerShell의 프로세스 빌드 경계와 CLR 콜백·로그 간 연결은 소스와 API 계약으로 보완했다.
-- **실행한 검사**는 `git archive HEAD`로 만든 임시 복사본의 기본 빌드와 테스트 24개, x86 COM probe의 콜백 3·4 인스턴스 생성, CLI `plan`의 정상 탐지·DLL 없음·강제 OFF·잘못된 파일 이름·빈 프로파일러 경로다. `launch`의 중복 시작은 임시 무동작 x86 실행 파일로 시험했다.
-- **경계 검사**로 공백이 포함된 체크아웃을 빌드하고, 별도 프로세스에서 `GetTempPathW`의 반환 길이를 확인했다. 길이 시험은 Win32 API만 호출했다. 네이티브 프로파일러의 잘못된 메모리 읽기나 충돌을 유발하는 시험은 수행하지 않았다.
-- 이번 감사에서 실제 한글 저장, 다중 Windows 세션, 네트워크 장애, 다른 Windows 버전을 다시 시험하지 않았다. 이전 문서의 실제 HWP5 저장·렌더 비교와 이번 결과를 구분했다. COM probe는 CLR 부착이나 ReJIT 동작까지 검증하지 않는다. 빌드와 실험은 임시 폴더에서 진행했다.
+- **CodeGraph:** 인덱스가 7개 파일에 대해 stale 상태여서 `codegraph sync`로 동기화한 뒤(268노드, 7파일 변경 반영)
+  다음 호출 관계를 확인했다. `SaveHookLauncher.CreatePlan/Launch/LaunchTransparentCore`의 GUI·CLI 호출자 3곳,
+  `LaunchTransparentCore/StartSingleInstance`의 `Local\HwpSaveHook.Launch` 뮤텍스 공유,
+  `HangulProcesses.GetState/IsHangulRunningInSession`의 GUI·CLI 호출자, `SaveHookSettings` 원자 기록의 6개 호출자,
+  `UpdateInstaller.Apply/Rollback/ReplaceFiles`와 `UpdateManifestVerifier.Verify/VerifySignature` 관계,
+  `RejitLog.WaitAsync/ReadStatus`의 GUI·CLI 호출자, 프로파일러 `LogRejitState` 5개 호출 지점.
+  전제는 CLI `codegraph`이며 MCP 도구는 사용하지 않았다.
+- **직접 읽은 주요 모듈:** Core 10개 파일 전체, GUI 2개 파일 전체, CLI 전체, 테스트 하네스 개요,
+  프로파일러 `.cpp`·`Target.h` 전체, `tools/inspect_format.py`, 릴리스 워크플로, 빌드 스크립트 2종.
+- **실행한 검사:** `python tools/inspect_format.py LICENSE` → `unknown`/종료 코드 6으로 음성 경로가 설계대로 동작함을 확인.
+  `codegraph status`(인덱스 23파일·1,526노드·2,498엣지), 테스트 영역별 집계(`Check` 113건).
+- **확인하지 못한 환경/외부 서비스:** .NET SDK·MSVC가 없어 빌드·런처 테스트를 실행하지 않았다.
+  실제 한글 설치가 없어 저장 E2E·ReJIT 실기·업데이트 서버 장애 주입도 수행하지 않았다.
+  이전 검증 기록의 실기 결과(HWP5 저장·렌더 비교)는 문서 주장으로만 인용하고 재검증하지 않았다.
+- **분석 한계:** CodeGraph 초기 스냅샷이 stale이어서 동기화 후 사용했고, C++ 측 호출 추적은 소스 직접 대조로 보완했다.
+  실행하지 않은 테스트를 실행했다고 쓰지 않으며, 재현하지 못한 문제는 `Likely` 이하로만 분류했다.
 
 ## 4. High-Risk Issues
 
-### [ISSUE-001] CLI의 기존 세션 검사 누락과 GUI의 시작 경합
+High-Risk에는 `Confirmed`와 근거가 강한 `Likely`만 둔다. 이번 감사에서 런타임 재현에 성공한 항목은 없고
+(SDK·한글 부재) 아래 3건은 코드 근거가 확정적이라 `Likely`로 둔다. Critical/High는 없다.
 
-- **위치** [CLI `Run`](private/save-hook/launcher/Program.cs#L121), [GUI `Start`와 `EnsureHangulClosed`](private/save-hook/gui/MainWindow.xaml.cs#L154), [공용 `Launch`](private/save-hook/core/SaveHookLauncher.cs#L164)
-- **우선순위** High
-- **신뢰도** Confirmed (CLI 검사 누락과 중복 시작). GUI 동시 시작은 Likely.
-- **문제** CLI가 기존 한글 프로세스를 조회하지 않는다. GUI의 조회와 `Process.Start`도 런처 사이에서 직렬화되지 않는다. CLI의 `hooked`는 실행 계획 값이고 `launched`는 프로세스 시작 결과다.
-- **발생 조건** 같은 세션에 한글이 실행 중인 상태에서 CLI를 사용하거나, 두 런처가 한글이 없는 상태를 동시에 확인한다.
-- **영향** 한글이 기존 인스턴스로 요청을 전달하면 새 프로세스에 넘긴 설정이 기존 창에 적용되지 않는다. 이때 사용자는 기존 저장 동작을 만날 수 있다. 실제 한글의 전달 동작은 이번 감사에서 재현하지 않았다.
-- **근거** 임시 폴더의 `Hwp.exe`가 살아 있는 동안 CLI를 OFF로 호출했다. CLI는 `launched`를 반환했고 같은 임시 실행 파일의 두 PID가 동시에 존재했다.
-- **반증 확인** `_busy`는 동일 GUI 창의 반복 요청을 막는다. `EnsureHangulClosed`는 호출 시점에 이미 실행 중인 프로세스를 막는다. 두 보호 장치 모두 CLI를 보호하거나 검사와 시작을 한 번에 처리하지는 않는다.
-- **호출/영향 범위** CodeGraph에서 확인한 GUI·CLI의 공용 `Launch`와 그 이후 자식 프로세스의 실행 모드 및 상태 표시.
-- **권장 수정 방향** 공용 실행 경계에 세션 검사와 런처 간 직렬화를 적용한다. 시작한 PID가 바로 종료되는 경우를 별도로 확인하고 실행 계획과 적용 결과를 분리한다.
-- **필요한 회귀 테스트** 기존 대체 `Hwp.exe`가 있을 때 GUI·CLI 실행을 거부한다. GUI와 CLI를 동시에 시작하면 자식이 한 건만 생긴다.
+### [ISSUE-001] 손상된 PE 입력에 파서가 ArgumentException을 흘려 CLI list가 비정상 종료한다
 
-### [ISSUE-002] ReJIT 요청 수락 이후의 실패가 GUI에 반영되지 않는다
+- **위치:** [HwpBuildInspector.cs](private/save-hook/core/HwpBuildInspector.cs) `InspectImage`·`ReadBlob`·`CallsOf`·`Image`,
+  [Program.cs](private/save-hook/launcher/Program.cs) `ListInstallations`
+- **우선순위:** Medium
+- **신뢰도:** Likely
+- **문제:** `InspectImage`의 catch는 `BadImageException·ArgumentOutOfRangeException·IndexOutOfRangeException·OverflowException`만
+  처리한다. 그런데 `ReadBlob`의 `Buffer.BlockCopy(pe.Bytes, at, value, 0, length)`는 범위를 벗어나면
+  `ArgumentException`을 던지고(문서화된 동작), `new byte[length]`는 거짓된 blob 길이 선언에 `OutOfMemoryException`을 던질 수 있다.
+  둘 다 catch 목록에 없어 호출자로 전파된다.
+- **발생 조건:** 레지스트리·설치 폴더 탐지 경로에, PE 헤더는 유효하지만 메타데이터 blob이 깨진 `Hwp.exe` 이름의 파일이 있고
+  `GetBinaryType`을 통과할 때. 손상된 설치본·수동 배치·악성 배치 모두 가능하다.
+  `MaxImageBytes`(512MB)는 파일 크기를 막을 뿐 blob 내부 길이 선언은 막지 못한다.
+- **영향:** `hwp-save-hook list`가 처리되지 않은 예외로 죽는다(종료 코드 계약 0/2/3/5 밖). 사용자 문서·설정에는 영향이 없다.
+- **근거:** catch 목록([HwpBuildInspector.cs](private/save-hook/core/HwpBuildInspector.cs#L122))과
+  `BlockCopy` 호출([HwpBuildInspector.cs](private/save-hook/core/HwpBuildInspector.cs#L277)),
+  `ListInstallations`의 catch가 `IOException·UnauthorizedAccessException·SecurityException·TimeoutException`뿐인 점.
+- **반증 확인:** GUI `Scan`·`Start`(→`RunOperation`, `ArgumentException` 처리),
+  CLI `plan`·`launch`(→종료 코드 2), CLI `inspect`(→종료 코드 2), `--open`(→포괄 catch+안내창)은
+  `ArgumentException`을 받아낸다. 그래서 실제 크래시는 `list` 경로에만 남는다.
+  `File.ReadAllBytes` 이전의 길이 상한, `checked` 연산, `U16/U32`의 `IndexOutOfRangeException` 경로(처리됨)도 확인했다.
+- **호출/영향 범위:** CodeGraph상 `Inspect` 호출자는 `CreatePlan`(2곳)·`ChooseCandidate`·`RunSmoke`·`list`·`inspect`.
+  크래시로 이어지는 것은 `list`뿐이며, `RunSmoke`는 해시 검증된 공식 artifact만 검사해 사실상 도달 불가다.
+- **권장 수정 방향:** `InspectImage` catch에 `ArgumentException`을 추가해 `Unreadable`로 반환한다(공유 파서 1곳 수정).
+  방어 차원에서 `ListInstallations` catch에도 `ArgumentException·NotSupportedException`을 추가한다.
+  `OutOfMemoryException`은 별도 상한(예: blob 길이 선언이 남은 이미지 크기를 넘으면 `BadImageException`)으로 막는다.
+- **필요한 회귀 테스트:** 유효 MZ/PE+CLR 헤더에 거짓 blob 길이를 넣은 fixture → `Inspect`는 `Unreadable`,
+  `list`는 크래시 없이 종료 코드 3 또는 5. 정상 관리 어셈블리에서는 기존 판정 불변.
 
-- **위치** [GUI `WaitForRejitRequest`](private/save-hook/gui/MainWindow.xaml.cs#L224), [`RequestOnWorker`](private/save-hook/profiler/HwpSaveHookProfiler.cpp#L370), [IL 설치·컴파일·오류 콜백](private/save-hook/profiler/HwpSaveHookProfiler.cpp#L180)
-- **우선순위** Medium
-- **신뢰도** Confirmed (상태 판정 경로). 실제 한글에서 메서드별 실패를 주입하지 않았다.
-- **문제** GUI는 요청 성공 로그 한 줄로 준비 완료를 표시하고 로그 확인을 끝낸다. 이후 `ReJITError`, IL 설치 실패나 비정상 컴파일 결과를 읽지 않는다.
-- **발생 조건** 요청이 성공을 반환했지만 대상 메서드 등록 또는 첫 실행 때 IL 설치·컴파일이 실패한다.
-- **영향** 준비 완료가 표시돼도 사용자가 예상한 HWP5 저장이 이루어지지 않을 수 있다. 사용자가 로그나 저장 파일을 직접 확인해야 상태 차이를 알 수 있다.
-- **근거** CLR의 요청 성공은 대상 등록 시도를 뜻하며, 메서드별 오류는 별도 콜백에 전달된다. [Microsoft RequestReJIT 계약](https://learn.microsoft.com/en-us/dotnet/framework/unmanaged-api/profiling/icorprofilerinfo4-requestrejit-method)
-- **반증 확인** 문서는 준비 완료를 요청 수락으로 정의하고 프로파일러는 실패를 기록한다. GUI가 그 기록을 읽지 않는 문제는 남는다. 실제 컴파일은 첫 저장에 지연될 수 있으므로 시작 시 최종 컴파일 결과까지 기다리게 하면 정상 흐름도 막을 수 있다.
-- **호출/영향 범위** GUI `Start` → `WaitForRejitRequest`, CLR 콜백 → 세션 로그 → 사용자 안내.
-- **권장 수정 방향** 요청 접수, 적용 확인, 실패를 별도 상태로 표시하고 동일 PID·토큰의 후속 로그를 반영한다.
-- **필요한 회귀 테스트** 요청 직후 메서드 오류, IL 설치 실패, 첫 저장의 지연된 성공, 자식 조기 종료에서 각각 다른 상태가 표시된다.
+### [ISSUE-002] 실행 중 한글 판정이 프로세스 이름에만 의존한다
 
-### [ISSUE-003] 네이티브 로그 폴백에서 버퍼 범위를 넘겨 읽을 수 있다
+- **위치:** [HangulProcesses.cs](private/save-hook/core/HangulProcesses.cs) `GetState`,
+  [SaveHookLauncher.cs](private/save-hook/core/SaveHookLauncher.cs) `IsHangulRunningInSession`
+- **우선순위:** Low
+- **신뢰도:** Likely
+- **문제:** `Process.GetProcessesByName("Hwp")` 매칭만 하고 실행 파일 경로는 확인하지 않는다.
+  한글이 아닌 동명 프로세스가 있으면 일반 `Launch`가 `already-running`으로 거부되고,
+  투명 실행에서는 `SomeUnhooked` 오경고가 뜰 수 있다. 발견 당시 임시 `Hwp.exe`로 같은 문제를 재현한 기록이 있다.
+- **발생 조건:** 사용자 세션에 `Hwp.exe`라는 이름의 다른 실행 파일이 떠 있을 때.
+- **영향:** fail-safe 방향이라 문서 손상 위험은 없고, 실행 거부·오경고에 그친다. 워크어라운드는 해당 프로세스 종료다.
+- **근거:** 두 함수 모두 이름 열거 후 세션·종료 여부만 보고, `TryGetProcessPath` 같은 경로 조회는 탐지(`AddRunningHangul`)에만 있다.
+- **반증 확인:** 세션 필터, 관리자 권한 프로세스의 보수적 처리, `Local\HwpSaveHook.Launch` 뮤텍스 직렬화는 확인했다.
+  그러나 이들은 런처 간 경합을 막을 뿐 이름 충돌은 막지 못한다.
+- **호출/영향 범위:** CodeGraph상 호출자는 GUI `Start`(→`RunOperation`)·`RefreshIntegrationStatus` 계열·CLI `launch`·`--open` 경고 분기.
+- **권장 수정 방향:** best-effort로 주 모듈 경로를 확인하고(`Hwp.exe` 파일명+읽기 가능 경로), 실패 시 기존 동작을 유지한다.
+  경로 확인 실패를 `Unknown`으로 구분하는 것은 현행 유지.
+- **필요한 회귀 테스트:** 동명 비한글 실행 파일을 띄운 상태에서 `launch`가 `already-running`이 아니라 정상 진행되거나
+  최소한 경로 무관 판정임을 로그로 구분한다. 실제 한글 실행 중에는 여전히 거부됨을 확인한다.
 
-- **위치** [프로파일러의 `LogPath`와 `Log`](private/save-hook/profiler/HwpSaveHookProfiler.cpp#L19)
-- **우선순위** Medium
-- **신뢰도** Confirmed (Win32 반환값과 코드의 경계 불일치). 프로파일러 충돌 자체는 재현하지 않았다.
-- **문제** `GetTempPathW`의 반환값이 버퍼 용량보다 커도 그 길이로 `std::wstring`을 만든다. 이때 반환값은 필요한 버퍼 크기다.
-- **발생 조건** 명시 로그 경로가 없거나 채택되지 않고, 임시 경로가 260자 버퍼에 들어가지 않는다.
-- **영향** 경로 조립 중 네이티브 코드가 버퍼 범위를 넘어 읽는다. 로그 손실이나 자식 한글 프로세스의 비정상 종료 가능성이 있다. 데이터 손상은 확인하지 않았다.
-- **근거** 격리된 API 호출에서 260자 버퍼에 대해 반환 길이 261을 확인했다. [Microsoft GetTempPathW 계약](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw)
-- **반증 확인** GUI의 정상 실행은 명시 로그 경로를 전달한다. CLI의 일반적인 후크 실행은 임시 경로 폴백을 사용할 수 있다. `Log`의 파일 열기 오류 처리는 그 전에 수행하는 문자열 생성을 보호하지 못한다.
-- **호출/영향 범위** CLR 초기화·모듈 로드·ReJIT·종료 콜백과 워커 → `Log` → 최초 `LogPath`.
-- **권장 수정 방향** 실패와 필요 길이를 먼저 검사한다. 제한 내에서 적절한 버퍼로 재시도하거나 로그를 생략하고, 로깅 실패를 CLR 콜백 경계에서 격리한다.
-- **필요한 회귀 테스트** 경로 미지정, API 반환값 0·정상·버퍼 초과, 쓰기 불가 폴더를 재현해 로그를 쓰거나 안전하게 생략하는지 확인한다.
+### [ISSUE-003] 복원 실패한 업데이트의 수동 복원용 백업이 다음 업데이트 때 삭제된다
 
-### [ISSUE-004] 공백이 있는 체크아웃에서 기본 빌드가 실패한다
-
-- **위치** [네이티브 빌드의 MSVC 인자](private/save-hook/profiler/build.ps1#L65), [루트 빌드의 PowerShell 호출](Build-Local.ps1#L19)
-- **우선순위** Medium
-- **신뢰도** Confirmed
-- **문제** Windows PowerShell에서 공백과 끝 역슬래시가 있는 개체 출력 경로를 네이티브 명령줄로 넘길 때 인자 경계가 깨진다.
-- **발생 조건** 경로에 공백이 있는 폴더에서 문서의 기본 빌드를 실행한다.
-- **영향** x86 DLL 빌드가 실패하면서 GUI 게시와 테스트까지 진행하지 못한다.
-- **근거** 같은 커밋을 `checkout with spaces` 아래에서 빌드했다. MSVC가 경로 조각을 별도 파일로 인식했고 링크 시 `LNK1181`이 발생했다. 공백 없는 복사본은 통과했다.
-- **반증 확인** 인자 배열, 절대 경로, 종료 코드 처리가 있다. Windows PowerShell의 네이티브 인자 직렬화 결과는 이 장치들로 고쳐지지 않는다.
-- **호출/영향 범위** `Build-Local.ps1` → Windows PowerShell → `profiler/build.ps1` → `cl.exe`와 링커.
-- **권장 수정 방향** `/Fo`에 끝 구분자 대신 명시적 개체 파일 경로를 사용하고 probe의 인자 전달도 확인한다.
-- **필요한 회귀 테스트** 공백이 없는 경로와 공백·한글이 섞인 경로 모두에서 EXE·DLL이 만들어지고 테스트가 통과한다.
-
-### [ISSUE-005] CLI의 빈 프로파일러 경로가 처리되지 않은 예외로 끝난다
-
-- **위치** [CLI 옵션 파싱과 계획 생성](private/save-hook/launcher/Program.cs#L55), [`CreatePlan`의 경로 정규화](private/save-hook/core/SaveHookLauncher.cs#L136)
-- **우선순위** Medium
-- **신뢰도** Confirmed
-- **문제** `--profiler`에 빈 문자열을 받을 수 있고, `Path.GetFullPath`를 호출하는 `CreatePlan`은 경로 탐지와 프로세스 시작의 예외 처리 구간 바깥에 있다.
-- **발생 조건** 읽을 수 있는 한글이 선택된 상태에서 호출자가 비어 있는 프로파일러 경로를 전달한다.
-- **영향** `plan`과 `launch`가 입력 오류를 정해진 방식으로 반환하지 못한다. 상위 자동화는 일반 입력 오류를 구분하기 어렵다.
-- **근거** 빈 인자를 그대로 전달한 `plan`에서 `ArgumentException`과 스택 추적을 확인했다. 잘못된 한글 실행 파일 이름은 정상적으로 종료 코드 2를 반환했다.
-- **반증 확인** 옵션 누락 검증, 한글 파일 이름 검사, 자식 실행 예외 처리는 각각 있다. 빈 값의 계획 생성 예외는 그 범위에 들지 않는다. GUI는 기본 DLL 경로와 자체 예외 처리 경계를 사용한다.
-- **호출/영향 범위** `LauncherCli.Run` → 공용 `CreatePlan` → 경로 정규화. CLI 입력 오류 경로에 국한된다.
-- **권장 수정 방향** 필수 옵션 값의 누락과 공백을 검증하고 계획 생성도 CLI 예외 처리 범위에 둔다.
-- **필요한 회귀 테스트** 빈 값·공백만 있는 값·누락은 정해진 오류 코드로 반환한다. 유효한 문법이지만 존재하지 않는 DLL 경로는 `profiler-missing`으로 구분한다.
+- **위치:** [UpdateInstaller.cs](private/save-hook/core/UpdateInstaller.cs) `ReplaceFiles`의 stale 백업 정리
+- **우선순위:** Low
+- **신뢰도:** Likely
+- **문제:** 롤백마저 실패하면 `"backup 폴더의 파일로 직접 복원하세요"`라고 안내하면서 `.update-backup-*`를 남기는데,
+  다음 업데이트의 `ReplaceFiles`는 `GetDirectories(target, ".update-backup-*")`를 무조건 지운다.
+  사용자가 수동 복원을 미룬 사이 다음 업데이트가 실행되면 최후 복원 재료가 사라진다.
+- **발생 조건:** 업데이트 N에서 `rolled-back`이 아닌 복원-실패가 난 뒤, 수동 복원 전에 업데이트 N+1이 실행될 때.
+- **영향:** 현재 설치물은 보호된다(매번 현재 상태의 새 백업을 만든다). 잃는 것은 과거 복원 지점뿐이며 사용자 문서와 무관하다.
+- **근거:** stale 정리 루프와 `rolled-back` 메시지의 모순을 코드로 확인.
+  정상·롤백-성공 시 백업 삭제는 타당하므로 해당 분기는 반증된다.
+- **호출/영향 범위:** `Apply → ReplaceFiles` 단일 경로. GUI `InstallUpdate`·헬퍼 `--apply-update`가 진입한다.
+- **권장 수정 방향:** 직전 결과가 복원-실패면 stale 삭제를 건너뛰고 경고하거나,
+  복원-실패 백업을 별도 이름으로 보관하고 자동 삭제 대상에서 제외한다.
+- **필요한 회귀 테스트:** 복원-실패 fixture를 만든 뒤 다시 `Stage·Apply`하면 구 백업이 보존되고 경고가 남는다.
+  정상 업데이트에서는 stale 백업이 정리됨을 함께 확인한다.
 
 ## 5. Potential Functional Gaps
 
-- **Confirmed Gap · 종단 자동 검증** 기존 자동 테스트는 계획, 환경변수, 설치 후보에 집중한다. COM probe 성공으로 토글 재시작, 실제 HWP5 저장이나 ReJIT 실패 안내의 회귀를 확인할 수 없다.
-- **Confirmed Gap · 여러 런처의 설정 갱신** 각 창이 시작 시 읽은 모드를 메모리에 보관한다. 한 창에서 변경한 값은 이미 열린 다른 창에 즉시 반영되지 않는다. 재시작 후 복원은 문서에 명시된 동작이며, 이미 열린 창의 갱신은 제품 결정이다.
-- **Likely Gap · 느린 설치 후보 취소** 작업 스레드에서 탐지하지만 취소 경로가 없다. 등록된 UNC 경로에서 열거 또는 읽기가 지연되면 `_busy` 동안 찾아보기와 재검색을 사용할 수 없다. 실제 네트워크 장애로 시간은 측정하지 않았다.
+- **Confirmed Gap · 저장 후 형식 자동 검증 없음:** `tools/inspect_format.py`는 수동 개발 도구다.
+  ReJIT 실패·미적용 상태에서 사용자가 HWPX로 저장해도 제품은 이를 감지하지 못하고, 안내는 문구에만 의존한다.
+- **Confirmed Gap · 여러 창 설정은 last-writer-wins:** 각 창이 시작 시점 값을 메모리에 들고 원자 기록으로 덮어쓴다.
+  활성화·실행 시 재읽기로 완화되지만 동시 편집의 병합은 없다. 문서화된 동작이므로 제품 결정 영역이다.
+- **Likely Gap · 매니페스트 만료 시 자동 확인이 조용히 스킵된다:** `Verify`의 만료는 `FormatException`이고
+  시작 시 자동 확인이 이를 묻지 않고 넘긴다. 사용자가 직접 확인 버튼을 누르기 전까지 구버전에 머문다.
+  수동 확인 경로에는 메시지가 있어 도달 가능성은 낮다.
+- **추정 · 구조 변경 내성:** 한컴이 대상 메서드 의미(IL 지문)를 바꾸면 `target-semantics-differ`로 안전하게 거부되지만,
+  그 뒤 사용자에게 남는 선택지는 OFF 일반 실행뿐이다. 자동 복구·대체 수단이 있으면 좋겠으나 현재 설계 범위를 넘는다.
 
 ## 6. Documentation Mismatches
 
-- [빌드 안내](docs/BUILD.md)에는 공백 없는 체크아웃 제약이 없다. 기본 명령이 공백 경로에서 실패하는 것을 확인했다. ISSUE-004 참조.
-- [README](README.md)와 [빌드 안내](docs/BUILD.md)는 GUI의 기존 한글 종료 절차를 안내한다. CLI 절은 기존 프로세스 검사가 GUI에만 있다는 점을 설명하지 않아 동일한 보호를 기대하기 쉽다. ISSUE-001 참조.
-- [빌드 안내](docs/BUILD.md)는 준비 완료를 ReJIT 요청 수락 단계로 정확히 설명한다. 화면의 문구에는 적용 확인과의 구분이 드러나지 않는다. ISSUE-002 참조.
+없음. 대조한 결과는 다음과 같다.
+
+- [docs/BUILD.md](docs/BUILD.md)의 종료 코드표(0/2/3/5)는 [Program.cs](private/save-hook/launcher/Program.cs)의 실제 반환과 일치한다.
+- 업데이트 개인정보 주장(사용자·문서 정보 미전송, `HwpSaveHook-Updater`만 전송)은 `Download` 구현과 일치한다.
+- `updates/latest.json`의 `version` 1.2.2은 `Directory.Build.props`의 `Version` 1.2.2과 일치하고 `expires_at`도 유효 기간 안이다.
+- 이전 검증 기록의 "테스트 24개 통과"는 작성 시점 기록이며, 현재 하네스는 `Check` 113건을 포함한다.
+  이 차이는 문서 오류가 아니라 경과에 따른 stale count로 본다.
+- `CLAUDE.md`·`AGENTS.md`는 체크아웃에 없고 참조하는 문서도 없어 실영향이 없다.
 
 ## 7. Recommended Fix Plan
 
 ### Phase 1 — Immediate
 
-공용 실행 경계에 기존 프로세스 검사와 직렬화를 적용한다(ISSUE-001). 네이티브 로그 폴백의 길이 검사를 보완한다(ISSUE-003). ReJIT 요청 접수와 적용 성공·실패 안내를 분리한다(ISSUE-002).
+- ISSUE-001 파서 강건화: `InspectImage`에 `ArgumentException`→`Unreadable` 처리와 blob 길이 상한 검사,
+  `ListInstallations` catch 보강. 공유 파서라 파급이 크고 수정은 작다.
 
 ### Phase 2 — Stability
 
-MSVC 인자 전달을 수정하고 공백·한글 경로에서 빌드한다(ISSUE-004). CLI 계획 예외와 입력 오류 계약을 보완한다(ISSUE-005). 필요하면 지연되는 설치 후보를 건너뛰는 동작과 여러 창의 설정 정책을 정의한다.
+- ISSUE-002 프로세스 신원 확인을 경로 기준으로 보강(실패 시 기존 동작 유지).
+- ISSUE-003 복원-실패 백업의 자동 삭제 제외 규칙.
+- 매니페스트 만료 시 1회성 안내(자동 확인에서도 상태 문구만 남기기).
 
 ### Phase 3 — Structural
 
-프로세스 실행과 프로파일러 상태 전이를 별도 테스트 대상으로 만든다. 합성 문서를 사용한 Windows 종단 시험을 추가하고, 파일 형식 검사와 실제 한글 재개방을 함께 검증한다.
+- 저장 후 형식 확인을 제품 흐름에 연결할지 결정(예: 첫 저장 후 샘플 검증 안내, 또는 범위 밖으로 명시).
+- 파서·실행 게이트·프로파일러 상태 전이에 대한 테스트 분리(`--cli` 하네스에서 crafted PE fixture 추가).
+- 여러 창 설정 정책(현행 유지인지 명시적 잠금인지) 문서화.
+
+실제 코드는 수정하지 않았다.
 
 ## 8. Test Recommendations
 
-| 유형 | 조건 | 기대 결과 |
+| 유형 | 입력 조건 | 기대 결과 |
 |---|---|---|
-| Unit | 빈 CLI 옵션·공백 값·누락과 문법상 유효하지만 없는 DLL | 입력 오류와 `profiler-missing`을 구분한다. |
-| Unit | 네이티브 임시 경로 API 결과 0, 정상 길이, 버퍼 초과와 쓰기 불가 폴더 | 로그를 쓰거나 안전하게 생략한다. |
-| Integration | 대체 실행 파일이 열린 상태에서 CLI·GUI로 시작 | 새 자식이 생성되지 않는다. |
-| Integration | 동일 PID의 요청 접수, 등록 오류, IL 설치 실패, 컴파일 성공 로그를 각각 공급 | 접수와 실제 적용이 분리되며, 다른 PID·토큰의 로그를 성공으로 처리하지 않는다. |
-| End-to-End | 지원 한글에서 ON으로 새 HWP 저장, 기존 HWP 수정 저장, 명시적 HWPX 저장, OFF 대조군 | 각 출력의 실제 형식이 기대와 같고 기존 HWP 수정본을 다시 열 수 있다. |
-| Concurrency | 두 런처의 동시 시작과 서로 다른 창의 설정 변경 | 실행은 한 건이며 설정 파일은 유효한 단일 값으로 남는다. |
-| Regression | 수동 경로로 시작 후 재실행, 경로가 사라진 상태, 여러 버전 동시 등록 | 수동 경로 복원, 자동 탐지 복귀, 지원 해시 우선 선택을 확인한다. |
-| Platform-specific | Windows의 공백·한글 경로, x64 WPF와 x86 DLL, 느린 UNC 후보 | 빌드와 로드가 성공하며 느린 후보에서 UI를 복구할 수 있다. |
+| Unit | PE 헤더 유효+blob 길이 거짓 fixture를 `Inspect`에 입력 | `Kind == Unreadable`, 예외 없음 |
+| Unit | 동일 fixture로 CLI `list` 실행(탐지 경로에 배치) | 크래시 없이 종료 코드 3 또는 5, 스택 트레이스 없음 |
+| Unit | `WriteSettingAtomic` 동시 2스레드 기록 | 파일이 유효한 단일 값(`on`/`off` 중 하나)으로 남음 |
+| Integration | 동명 비한글 `Hwp` 프로세스 실행 중 `launch` | `already-running`이 아니라 정상 진행 |
+| Integration | 실제 한글 실행 중 GUI·CLI 시작 | 자식 프로세스 미생성, `already-running` 경로 |
+| Integration | 동일 PID·토큰의 `request-accepted/il-installed/compiled/failed` 로그 조합 | 요청접수와 적용됨·실패가 분리 표시되고 타 PID·타 토큰은 무시 |
+| End-to-End | 지원 빌드 ON: 새 HWP 저장·기존 HWP 편집 저장·명시적 HWPX 저장·OFF 대조군 | 각 출력 형식이 기대와 일치하고 기존 HWP 재개방 가능 |
+| Concurrency | GUI·CLI 동시 시작, 두 창의 설정 변경 | 자식 1건, 설정 파일 유효 |
+| Regression | 수동 경로 저장 후 재실행·경로 소실·여러 버전 등록 | 수동 복원·자동 복귀·검증 해시 우선 선택 |
+| Regression | 복원-실패 백업 존재 후 재업데이트 | 구 백업 보존+경고, 정상 케이스는 stale 정리 |
+| Platform-specific | 공백·한글 경로 체크아웃 빌드, x64 GUI+x86 DLL, 느린 UNC 후보 | 빌드·로드 성공, 8초 타임아웃 후 안내 문구 |
 
 ## 9. Final Assessment
 
-| 항목 | 평가 | 근거 |
-|---|---|---|
-| Functional Correctness | Acceptable | 기본 실행 계획과 형식 선택은 일관되지만 실제 적용 상태의 표시가 부족하다. |
-| Runtime Stability | Needs Work | 런처 간 중복 실행과 네이티브 폴백의 경계 처리가 남아 있다. |
-| Data Integrity | Acceptable | 데이터 손상을 확인하지 않았다. 적용 실패 시 출력 형식이 예상과 다를 수 있다. |
-| Error Resilience | Needs Work | 계획 예외와 요청 이후 ReJIT 실패가 일관된 결과로 전달되지 않는다. |
-| Cross-platform Robustness | Needs Work | Windows 전용은 설계 범위이며, 그 범위 안에서도 공백 체크아웃에서 빌드가 실패한다. |
-| Test Confidence | Needs Work | 24개 테스트와 COM probe는 통과했다. 경합·프로세스 상태·실제 저장의 자동 회귀 범위는 부족하다. |
+- **Functional Correctness:** Acceptable — 핵심 흐름(탐지·게이트·실행·상태·업데이트·복원)이 코드로 완결되고, 이전 감사의 5건이 해소됐다. 잔여 1건(Medium)은 진단 명령에 국한된다.
+- **Runtime Stability:** Acceptable — 실행 경계가 뮤텍스로 직렬화되고, 타임아웃·취소·백그라운드 관찰 종료가 있다. 파서 예외 누수 1건이 흠이다.
+- **Data Integrity:** Good — 사용자 문서를 쓰지 않고, 설정·레지스트리 변경은 백업 후 원자 기록한다. 업데이트도 smoke+롤백이 있다(백업 보관 1건 제외).
+- **Error Resilience:** Needs Work — 대부분 경로의 예외 계약은 깨끗하지만, 공유 PE 파서의 입력 강건성이 한 단계 모자라다(ISSUE-001).
+- **Cross-platform Robustness:** Acceptable — Windows 전용 설계이며, 공백·한글 경로와 x86/x64 경계는 코드상 대응됐다. 다만 이번 감사에서 빌드·실기를 실행하지 못해 검증은 코드 수준에 한정된다.
+- **Test Confidence:** Acceptable — `Check` 113건의 자체 하네스가 게이트·탐지·ReJIT 상태·연동·업데이트를 가린다. crafted PE·E2E 실기 영역은 비어 있다.
 
-**실제로 먼저 수정할 세 가지**는 공용 실행 경계의 중복 시작 방지(ISSUE-001), 네이티브 로그 경로의 버퍼 검증(ISSUE-003), ReJIT 요청과 적용 상태의 분리(ISSUE-002)다.
-
-## 10. Remediation Status
-
-2026-11-26 작업 트리(미커밋) 기준이다. `Build-Local.ps1` 전체 빌드는 성공했고 테스트 39/39가 통과했다. 실제 한글 저장은 다시 시험하지 않았다.
-
-| 항목 | 조치 | 검증 |
-|---|---|---|
-| ISSUE-001 | 공용 `Launch`가 `Local\HwpSaveHook.Launch` 뮤텍스 안에서 세션의 `Hwp.exe`를 검사한 뒤 시작한다(`StartSingleInstance`). GUI의 개별 검사는 제거했다. GUI·CLI는 `already-running`을 구분해 표시하고, 일반 모드에서 바로 종료된 자식도 따로 보고한다. | 동시 요청 시 자식 1건, 거부 후 재사용 테스트 |
-| ISSUE-002 | 프로파일러가 `ReJITState: token=… state=` 로그(`request-accepted`, `il-installed`, `compiled`, `failed`)를 남긴다. `RejitLog`가 같은 PID·토큰만 읽어 요청 접수, 적용, 실패, 조기 종료를 구분한다. GUI는 접수 뒤에도 첫 저장의 컴파일 결과를 계속 관찰한다. | 상태 판정 단위 테스트 5건 |
-| ISSUE-003 | `GetEnvironmentVariableW`와 `GetTempPathW`의 필요 길이를 확인하고 재시도한다. 실패하면 로그를 생략한다. `Log`는 `noexcept`이며 예외를 CLR 경계 밖으로 내보내지 않는다. | 빌드 확인. 버퍼 초과 재현 시험은 미실시 |
-| ISSUE-004 | `/Fo`에 명시적 개체 파일 경로를 넘기도록 바꿨다(`build.ps1`, `build-and-probe.ps1`). | 공백·한글이 포함된 경로에서 x86 DLL 빌드 성공 |
-| ISSUE-005 | 값이 필요한 옵션의 누락, 공백, 다음 옵션과의 혼동을 종료 코드 2로 거부한다. SHA-256 형식을 검증하고 계획 생성도 예외 처리 범위에 넣었다. | CLI 하위 프로세스 테스트 6건 |
-| 느린 설치 후보 | 설치 탐지에 취소 토큰과 8초 시한(`InspectWithTimeoutAsync`)을 적용했다. | 응답 없는 검사의 시한 반환 테스트 |
-| 여러 창의 설정 | 창 활성화 시와 **한글 열기** 직전에 저장된 모드를 다시 읽는다. | 수동 확인 필요 |
-| 문서 불일치 | [빌드 안내](docs/BUILD.md)에 공통 실행 보호, 단계별 ReJIT 상태, 설치 확인 시한, CLI 상태·종료 코드를 반영했다. | — |
-
-남은 일은 실제 한글에서 ON/OFF 저장 종단 시험, ReJIT 실패 주입 시험, 네이티브 로그 경로의 버퍼 초과 재현이다.
+**먼저 수정할 문제 3개:** ISSUE-001(파서 `ArgumentException`→`Unreadable`+`list` catch),
+ISSUE-002(이름이 아닌 경로 기반 실행 중 판정), ISSUE-003(복원-실패 백업 자동 삭제 제외).

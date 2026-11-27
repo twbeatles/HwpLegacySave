@@ -76,6 +76,9 @@ public partial class MainWindow : Window
         {
             ActivityStatus.Text = "설치된 한글을 확인하는 중입니다.";
             _plan = null;
+            _logPath = null;
+            LogButton.Visibility = Visibility.Collapsed;
+            VerifyButton.Visibility = Visibility.Collapsed;
             HwpPath.Text = "";
             BuildStatus.Text = "";
             int others = 0;
@@ -263,6 +266,11 @@ public partial class MainWindow : Window
                     ActivityStatus.Text = "현재 최신 버전입니다.";
                 }
             }
+            catch (ManifestExpiredException error) when (!userInitiated)
+            {
+                // 만료는 설정 문제가 아니라 방치하면 구버전에 머무르므로 한 번만 알린다.
+                if (!_busy) ActivityStatus.Text = $"업데이트 정보를 확인할 수 없습니다. {error.Message}";
+            }
             catch (Exception error) when (!userInitiated && error is IOException or InvalidDataException or FormatException
                                           or System.Security.Cryptography.CryptographicException or InvalidOperationException
                                           or UnauthorizedAccessException or System.Security.SecurityException)
@@ -432,6 +440,9 @@ public partial class MainWindow : Window
         await RunOperation(async () =>
         {
             ActivityStatus.Text = "한글을 시작하는 중입니다.";
+            _logPath = null;
+            LogButton.Visibility = Visibility.Collapsed;
+            VerifyButton.Visibility = Visibility.Collapsed;
             LaunchPlan plan = await HwpInstallations.InspectWithTimeoutAsync(token =>
             {
                 string? path = HwpInstallations.FindPreferred(selected.HwpPath, token);
@@ -512,6 +523,7 @@ public partial class MainWindow : Window
     {
         _logPath = File.Exists(log) ? log : null;
         LogButton.Visibility = _logPath is null ? Visibility.Collapsed : Visibility.Visible;
+        VerifyButton.Visibility = LogButton.Visibility;
         ActivityStatus.Text = status switch
         {
             RejitStatus.RequestAccepted => "HWP 저장 요청이 접수됐습니다. 첫 저장에서 적용 결과를 확인합니다.",
@@ -526,6 +538,19 @@ public partial class MainWindow : Window
     {
         _observation?.Cancel();
         base.OnClosed(e);
+    }
+
+    private void Verify_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new OpenFileDialog
+        {
+            Title = "저장한 파일 형식 확인",
+            Filter = "한글 문서|*.hwp;*.hwpx|모든 파일|*.*",
+            CheckFileExists = true
+        };
+        if (picker.ShowDialog(this) != true) return;
+        SavedFileCheck result = SavedFileInspector.Inspect(picker.FileName);
+        ActivityStatus.Text = result.Note;
     }
 
     private void Log_Click(object sender, RoutedEventArgs e)

@@ -165,9 +165,14 @@
                 <TextBlock x:Name="ActivityStatus" Foreground="{StaticResource Ink}" TextWrapping="Wrap"
                            AutomationProperties.LiveSetting="Polite" />
             </Border>
-            <Button x:Name="LogButton" Content="실행 로그 열기" Click="Log_Click"
-                    Style="{StaticResource LauncherButton}" Margin="0,12,0,0"
-                    Visibility="Collapsed" HorizontalAlignment="Left" />
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                <Button x:Name="LogButton" Content="실행 로그 열기" Click="Log_Click"
+                        Style="{StaticResource LauncherButton}"
+                        Visibility="Collapsed" />
+                <Button x:Name="VerifyButton" Content="저장 파일 형식 확인" Click="Verify_Click"
+                        Style="{StaticResource LauncherButton}" Margin="9,0,0,0"
+                        Visibility="Collapsed" />
+            </StackPanel>
         </StackPanel>
     </StackPanel>
 </Window>

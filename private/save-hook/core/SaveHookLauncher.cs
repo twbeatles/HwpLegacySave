@@ -443,7 +443,10 @@ public static class SaveHookLauncher
                 try
                 {
                     if (instance.SessionId != session) continue;
-                    if (!instance.HasExited) return true;
+                    if (instance.HasExited) continue;
+                    // 같은 이름의 다른 프로그램 때문에 실행을 막지 않는다. 알 수 없으면 실행 중으로 본다.
+                    if (!HangulProcesses.LooksLikeHangulInstance(instance)) continue;
+                    return true;
                 }
                 catch (InvalidOperationException) when (instance.HasExited) { }
                 catch (Win32Exception)

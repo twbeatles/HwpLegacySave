@@ -13,6 +13,9 @@ public sealed record UpdateManifest(Version Version, string ArtifactUrl, string 
 /// <summary>검증은 통과했지만 현재 버전보다 새 버전이 아니다.</summary>
 public sealed class NoUpdateAvailableException(string message) : Exception(message);
 
+/// <summary>서명은 맞지만 매니페스트가 만료됐다. FormatException으로 잡히던 기존 처리는 그대로 동작한다.</summary>
+public sealed class ManifestExpiredException(string message) : FormatException(message);
+
 /// <summary>
 /// 업데이트 매니페스트(updates/latest.json)의 형식·서명 검증.
 /// 서명은 ECDSA P-256 + SHA-256(IEEE P1363, r||s)이며, .NET Framework 4.8과 .NET 10 모두 기본 제공 API로 검증한다.
@@ -76,7 +79,7 @@ public static class UpdateManifestVerifier
         {
             throw new FormatException("매니페스트 만료 시각이 잘못됐습니다.");
         }
-        if (expiresAt <= (now ?? DateTimeOffset.UtcNow)) throw new FormatException("매니페스트가 만료됐습니다.");
+        if (expiresAt <= (now ?? DateTimeOffset.UtcNow)) throw new ManifestExpiredException("매니페스트가 만료됐습니다.");
         if (Normalize(version) <= Normalize(currentVersion))
         {
             throw new NoUpdateAvailableException("현재 버전이 최신입니다.");

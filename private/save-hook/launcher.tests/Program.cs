@@ -232,7 +232,7 @@ Check("hash: missing file -> null", SaveHookLauncher.TryHashFile(Path.Combine(Pa
 
 if (args is ["--cli", string dotnet, string cli])
 {
-    async Task<(int Code, string Output, string Error)> RunPlan(params string[] arguments)
+    async Task<(int Code, string Output, string Error)> RunCliEnv(IDictionary<string, string?>? env, params string[] arguments)
     {
         var start = new ProcessStartInfo(dotnet)
         {
@@ -240,7 +240,15 @@ if (args is ["--cli", string dotnet, string cli])
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
-        foreach (string arg in new[] { cli, "plan" }.Concat(arguments)) start.ArgumentList.Add(arg);
+        if (env is not null)
+        {
+            foreach ((string key, string? value) in env)
+            {
+                if (value is null) start.Environment.Remove(key);
+                else start.Environment[key] = value;
+            }
+        }
+        foreach (string arg in new[] { cli }.Concat(arguments)) start.ArgumentList.Add(arg);
         using Process child = Process.Start(start)!;
         Task<string> output = child.StandardOutput.ReadToEndAsync();
         Task<string> error = child.StandardError.ReadToEndAsync();
@@ -253,6 +261,12 @@ if (args is ["--cli", string dotnet, string cli])
         }
         return (child.ExitCode, await output, await error);
     }
+
+    Task<(int Code, string Output, string Error)> RunCli(params string[] arguments) =>
+        RunCliEnv(null, arguments);
+
+    Task<(int Code, string Output, string Error)> RunPlan(params string[] arguments) =>
+        RunCli(new[] { "plan" }.Concat(arguments).ToArray());
 
     foreach (string[] input in new[] { new[] { "--profiler", "" }, new[] { "--profiler", " " },
                  new[] { "--profiler" }, new[] { "--profiler", "--force-no-hook" } })
@@ -275,6 +289,57 @@ if (args is ["--cli", string dotnet, string cli])
     finally
     {
         try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+    }
+
+    // --- 업데이터: 키 생성과 서명 (릴리스 파이프라인 경로, 기존 무커버리지) ---
+    string keyEnv = "HWP_SAVEHOOK_TEST_" + Guid.NewGuid().ToString("N");
+    string keyDir = NewTempDir();
+    try
+    {
+        string keyFile = Path.Combine(keyDir, "test-private-key.txt");
+        var keygen = await RunCli("update-keygen", "--private-key-out", keyFile);
+        Check("update-keygen: creates a new key file",
+            keygen.Code == 0 && File.Exists(keyFile) && keygen.Output.Trim().Length == 88);
+        var keygenAgain = await RunCli("update-keygen", "--private-key-out", keyFile);
+        Check("update-keygen: refuses to overwrite an existing key", keygenAgain.Code == 2);
+        bool usableKey = false;
+        try
+        {
+            using ECDsa probe = ECDsa.Create();
+            probe.ImportPkcs8PrivateKey(Convert.FromBase64String(File.ReadAllText(keyFile).Trim()), out _);
+            usableKey = true;
+        }
+        catch { }
+        Check("update-keygen: the file is a usable PKCS#8 key", usableKey);
+
+        string artifact = Path.Combine(keyDir, "package.zip");
+        File.WriteAllBytes(artifact, [0x50, 0x4B, 0x03, 0x04, 0x00]);
+        string manifest = Path.Combine(keyDir, "latest.json");
+        var key = new Dictionary<string, string?> { [keyEnv] = File.ReadAllText(keyFile).Trim() };
+        var signed = await RunCliEnv(key, "update-sign", "--version", "9.0.0", "--artifact", artifact,
+            "--url", "https://example.invalid/a.zip", "--out", manifest,
+            "--private-key-env", keyEnv, "--expires-in-days", "30");
+        Check("update-sign: signs an artifact manifest",
+            signed.Code == 0 && File.Exists(manifest));
+        Check("update-sign: the manifest verifies against the keygen key",
+            UpdateManifestVerifier.Verify(File.ReadAllText(manifest), keygen.Output.Trim(), new Version(1, 0, 0)) is not null);
+
+        var missingKey = await RunCli("update-sign", "--version", "9.0.0", "--artifact", artifact,
+            "--url", "https://example.invalid/a.zip", "--out", manifest + ".2",
+            "--private-key-env", keyEnv);
+        Check("update-sign: missing key is rejected", missingKey.Code == 2);
+        var httpUrl = await RunCliEnv(key, "update-sign", "--version", "9.0.0", "--artifact", artifact,
+            "--url", "http://example.invalid/a.zip", "--out", manifest + ".3",
+            "--private-key-env", keyEnv);
+        Check("update-sign: non-HTTPS artifact URL is rejected", httpUrl.Code == 2);
+        var badVersion = await RunCliEnv(key, "update-sign", "--version", "nine", "--artifact", artifact,
+            "--url", "https://example.invalid/a.zip", "--out", manifest + ".4",
+            "--private-key-env", keyEnv);
+        Check("update-sign: bad version is rejected", badVersion.Code == 2);
+    }
+    finally
+    {
+        try { Directory.Delete(keyDir, recursive: true); } catch { /* best effort */ }
     }
 }
 
@@ -604,6 +669,117 @@ if (args is ["--cli", string dotnet, string cli])
     {
         Check("processes: no running Hangul -> None", HangulProcesses.GetState() == RunningHangulState.None);
     }
+    // ISSUE-002: 동명 비한글 프로세스는 한글로 판정하지 않는다. 알 수 없으면 보수적으로 한글로 본다.
+    Check("processes: unrelated executable is not Hangul",
+        !HangulProcesses.LooksLikeHangulExecutable(Path.Combine(Environment.SystemDirectory, "notepad.exe")));
+    Check("processes: unknown or missing path stays conservative",
+        HangulProcesses.LooksLikeHangulExecutable(null) &&
+        HangulProcesses.LooksLikeHangulExecutable(Path.Combine(Path.GetTempPath(), "hwp-save-hook-no-such-file.exe")));
+
+    // ISSUE-002 게이트 수준 확인: 동명 비한글 프로세스가 떠 있어도 실행 검사가 통과한다.
+    // 실제 한글이 떠 있으면 판정이 섞이므로 그때는 건너뛴다.
+    bool genuineRunning = false;
+    foreach (Process running in Process.GetProcessesByName("Hwp"))
+    {
+        using (running)
+        {
+            if (HangulProcesses.LooksLikeHangulInstance(running)) { genuineRunning = true; break; }
+        }
+    }
+    if (genuineRunning)
+    {
+        Console.WriteLine("  SKIP  processes: fake Hwp gate test (genuine Hangul running)");
+    }
+    else
+    {
+        string fakeDir = NewTempDir();
+        Process? fake = null;
+        bool gateOpen = false;
+        try
+        {
+            string fakePath = Path.Combine(fakeDir, "Hwp.exe");
+            File.Copy(Path.Combine(Environment.SystemDirectory, "timeout.exe"), fakePath);
+            fake = Process.Start(new ProcessStartInfo(fakePath, "/t 60 /nobreak")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            });
+            gateOpen = fake is not null && !SaveHookLauncher.IsHangulRunningInSession() &&
+                HangulProcesses.GetState() == RunningHangulState.None;
+        }
+        catch { gateOpen = false; }
+        finally
+        {
+            try
+            {
+                if (fake is not null)
+                {
+                    if (!fake.HasExited) fake.Kill();
+                    fake.WaitForExit(5000);
+                    fake.Dispose();
+                }
+            }
+            catch { /* best effort */ }
+            try { Directory.Delete(fakeDir, recursive: true); } catch { /* best effort */ }
+        }
+        Check("processes: unrelated Hwp process does not block the gate", gateOpen);
+    }
+}
+
+// --- 저장 파일 형식 확인 ---
+{
+    string dir = NewTempDir();
+    try
+    {
+        string hwp = Path.Combine(dir, "saved.hwp");
+        File.WriteAllBytes(hwp, [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00]);
+        Check("savedfile: CFB magic is an HWP candidate",
+            SavedFileInspector.Inspect(hwp).Kind == SavedFileKind.HwpCandidate);
+
+        string hwpx = Path.Combine(dir, "saved.hwpx");
+        using (var zip = ZipFile.Open(hwpx, ZipArchiveMode.Create))
+        {
+            using (var writer = new StreamWriter(zip.CreateEntry("mimetype").Open())) writer.Write("application/hwp+zip");
+            using (var writer = new StreamWriter(zip.CreateEntry("Contents/header.xml").Open())) writer.Write("<x/>");
+            using (var writer = new StreamWriter(zip.CreateEntry("Contents/section0.xml").Open())) writer.Write("<x/>");
+        }
+        Check("savedfile: HWPX package is an HWPX candidate",
+            SavedFileInspector.Inspect(hwpx).Kind == SavedFileKind.HwpxCandidate);
+
+        string text = Path.Combine(dir, "saved.txt");
+        File.WriteAllText(text, "hello");
+        Check("savedfile: plain text is unknown",
+            SavedFileInspector.Inspect(text).Kind == SavedFileKind.Unknown);
+        Check("savedfile: missing file is unknown, not fatal",
+            SavedFileInspector.Inspect(Path.Combine(dir, "no-such-file.hwp")).Kind == SavedFileKind.Unknown);
+    }
+    finally
+    {
+        try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+    }
+}
+
+// --- 동시 실행: 시작 경계 직렬화 ---
+{
+    string mutex = @"Local\HwpSaveHook.Test." + Guid.NewGuid().ToString("N");
+    int inside = 0;
+    bool overlapped = false;
+    int completed = 0;
+    Func<int> guarded = () => SaveHookLauncher.StartSingleInstance(() => false, () =>
+    {
+        if (Interlocked.CompareExchange(ref inside, 1, 0) != 0) overlapped = true;
+        Thread.Sleep(150);
+        Volatile.Write(ref inside, 0);
+        Interlocked.Increment(ref completed);
+        return 1;
+    }, mutex);
+    var first = Task.Run(guarded);
+    var second = Task.Run(guarded);
+    Task.WaitAll(first, second);
+    Check("concurrency: concurrent launches are serialized",
+        !overlapped && completed == 2 && first.Result == 1 && second.Result == 1);
 }
 
 // --- 버전 호환: 실행 파일 구조 판정 ---
@@ -617,6 +793,23 @@ if (args is ["--cli", string dotnet, string cli])
 
     Check("inspect: garbage bytes are unreadable",
         HwpBuildInspector.InspectImage([0x4D, 0x5A, 0x00]).Kind == HwpBuildKind.Unreadable);
+
+    // ISSUE-001: 변조된 바이너리가 파서 예외를 밖으로 흘리면 안 된다.
+    byte[] coreImage = File.ReadAllBytes(typeof(SaveHookLauncher).Assembly.Location);
+    bool parserSurvives = true;
+    for (int mutation = 0; mutation < 64 && parserSurvives; mutation++)
+    {
+        byte[] mutated = (byte[])coreImage.Clone();
+        mutated[(mutation * 997) % mutated.Length] ^= 0xFF;
+        try { HwpBuildInspector.InspectImage(mutated); }
+        catch { parserSurvives = false; }
+    }
+    Check("inspect: single-byte mutations never escape the parser", parserSurvives);
+    bool truncatedSurvives = true;
+    try { HwpBuildInspector.InspectImage(coreImage[..1024]); }
+    catch { truncatedSurvives = false; }
+    Check("inspect: truncated image is unreadable, not fatal",
+        truncatedSurvives && HwpBuildInspector.InspectImage(coreImage[..1024]).Kind == HwpBuildKind.Unreadable);
 
     Check("inspect: product names follow the HOffice major version",
         HwpBuildInspector.DescribeProduct("10.0.0.1") == "한글 2018" &&
@@ -722,6 +915,8 @@ if (args is ["--cli", string dotnet, string cli])
         Rejects<NoUpdateAvailableException>(() => UpdateManifestVerifier.Verify(Manifest(version: "1.2"), publicKey, current)));
     Check("update: expired manifest is rejected",
         Rejects<FormatException>(() => UpdateManifestVerifier.Verify(Manifest(expires: "2000-01-01T00:00:00Z"), publicKey, current)));
+    Check("update: expired manifest throws the expiry subtype",
+        Rejects<ManifestExpiredException>(() => UpdateManifestVerifier.Verify(Manifest(expires: "2000-01-01T00:00:00Z"), publicKey, current)));
     Check("update: HTTP artifact is rejected even when signed",
         Rejects<FormatException>(() => UpdateManifestVerifier.Verify(Manifest(url: "http://example.invalid/a.zip"), publicKey, current)));
     using var other = ECDsa.Create(ECCurve.NamedCurves.nistP256);
@@ -805,6 +1000,15 @@ if (args is ["--cli", string dotnet, string cli])
             File.ReadAllText(Path.Combine(install, "user-note.txt")) == "keep" &&
             Directory.GetDirectories(install, ".update-backup-*").Length == 0);
         Check("apply: smoke check runs the installed launcher", smoked == Path.Combine(install, "HwpSaveHook.exe"));
+
+        // ISSUE-003: 예전 실패분의 백업은 다음 업데이트가 지우면 안 된다.
+        string staleBackup = Path.Combine(install, ".update-backup-old");
+        Directory.CreateDirectory(staleBackup);
+        File.WriteAllText(Path.Combine(staleBackup, "HwpSaveHook.exe"), "older");
+        UpdateResult preserved = UpdateInstaller.ReplaceFiles(payload, install, "9.0.1", _ => true);
+        Check("apply: stale backups from failed restores are preserved",
+            preserved.Status == "applied" && Directory.Exists(staleBackup) &&
+            File.ReadAllText(Path.Combine(install, "HwpSaveHook.exe")) == "new-exe");
 
         string staging = Path.Combine(dir, "updates");
         Check("apply: only Stage work folders are cleaned after success",

@@ -238,10 +238,9 @@ public static class UpdateInstaller
         string source = Path.GetFullPath(payload);
         string target = Path.GetFullPath(installDirectory);
         string backup = Path.Combine(target, $".update-backup-{Guid.NewGuid():N}");
-        foreach (string stale in Directory.GetDirectories(target, ".update-backup-*"))
-        {
-            TryDeleteDirectory(stale);
-        }
+        // 예전 실패분의 백업은 지우지 않는다. 복원마저 실패한 백업은 사용자가 직접 복원하는
+        // 최후 수단이므로(ISSUE-003), 다음 업데이트가 조용히 지우면 복원 재료가 사라진다.
+        // 성공·롤백-성공 시에는 그 실행이 만든 백업만 정리하고, 남는 것은 수 MB 수준이라 둔다.
         var replaced = new List<(string Target, string? Backup)>();
         string[] files = Directory.GetFiles(source, "*", SearchOption.AllDirectories);
         try

@@ -253,8 +253,10 @@ internal static class LauncherCli
             WriteJson(new JsonObject { ["count"] = all.Count, ["installations"] = items });
             return all.Count == 0 ? 3 : 0;
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or TimeoutException)
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or TimeoutException
+                                      or ArgumentException or NotSupportedException)
         {
+            // 손상된 실행 파일의 파서 실패(ArgumentException 등)도 진단 코드로 반환한다.
             WriteJson(new JsonObject { ["status"] = "inspection-failed", ["error"] = error.Message });
             return 5;
         }
