@@ -43,6 +43,28 @@ public static class SaveHookSettings
     public static void WriteHookEnabled(bool enabled, string? settingsDirectory = null) =>
         WriteSettingAtomic(GetModeFilePath(settingsDirectory), enabled ? "on" : "off", settingsDirectory);
 
+    public static string GetCompatibleModeFilePath(string? settingsDirectory = null) =>
+        Path.Combine(settingsDirectory ?? DefaultSettingsDirectory, "compatible-mode.txt");
+
+    /// <summary>
+    /// 검증되지 않았지만 대상 메서드 구조가 같은 한글 빌드에도 적용할지 여부. 기본값은 OFF다.
+    /// 파일을 읽지 못하면 안전하게 OFF로 본다.
+    /// </summary>
+    public static bool ReadCompatibleEnabled(string? settingsDirectory = null)
+    {
+        try
+        {
+            return string.Equals(File.ReadAllText(GetCompatibleModeFilePath(settingsDirectory)).Trim(), "on", StringComparison.Ordinal);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    public static void WriteCompatibleEnabled(bool enabled, string? settingsDirectory = null) =>
+        WriteSettingAtomic(GetCompatibleModeFilePath(settingsDirectory), enabled ? "on" : "off", settingsDirectory);
+
     public static string? ReadSelectedPathRaw(string? settingsDirectory = null)
     {
         string selectedPathFile = GetSelectedPathFilePath(settingsDirectory);

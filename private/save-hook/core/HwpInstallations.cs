@@ -69,18 +69,24 @@ public static class HwpInstallations
     internal static string? ChooseCandidate(IEnumerable<string> candidates, string expectedSha256,
         CancellationToken cancellationToken = default)
     {
-        string? first = null;
+        // 검증된 빌드 → 대상 메서드 구조가 같은 빌드(2018·2020·2024 등) → 첫 실행 파일 순으로 고른다.
+        string? first = null, compatible = null;
         foreach (string path in candidates.Distinct(PathComparer))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!IsExecutable(path)) continue;
             first ??= path;
-            if (PathComparer.Equals(SaveHookLauncher.TryHashFile(path), expectedSha256))
+            string? hash = SaveHookLauncher.TryHashFile(path);
+            if (PathComparer.Equals(hash, expectedSha256) || HwpBuildCatalog.Find(hash) is not null)
             {
                 return path;
             }
+            if (compatible is null && HwpBuildInspector.Inspect(path).HasCompatibleTarget)
+            {
+                compatible = path;
+            }
         }
-        return first;
+        return compatible ?? first;
     }
 
     private static List<string> Discover(CancellationToken cancellationToken)

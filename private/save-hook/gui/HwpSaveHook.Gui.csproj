@@ -17,4 +17,9 @@
   <ItemGroup>
     <Compile Include="../core/*.cs" Link="Core/%(Filename)%(Extension)" />
   </ItemGroup>
+  <!-- 업데이터용 .NET Framework 기본 어셈블리. 배포 폴더에 복사되지 않는다. -->
+  <ItemGroup>
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+  </ItemGroup>
 </Project>

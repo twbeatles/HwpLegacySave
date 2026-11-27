@@ -77,6 +77,7 @@
                 <TextBlock Text="한글 HWP 저장 런처" Foreground="White" FontWeight="Bold" FontSize="29" />
                 <TextBlock Text="다른 이름으로 저장하거나 기존 문서를 저장할 때 HWP 형식을 유지합니다."
                            Foreground="#DEE9FA" Margin="0,8,0,0" TextWrapping="Wrap" />
+                <TextBlock x:Name="VersionText" Foreground="#A9BEDD" Margin="0,6,0,0" FontSize="12" />
             </StackPanel>
         </Border>
         <StackPanel Margin="28,23,28,25">
@@ -113,6 +114,19 @@
                 </DockPanel>
             </Border>
             <Border Background="White" BorderBrush="#D9E1EB" BorderThickness="1" CornerRadius="12"
+                    Padding="19,14" Margin="0,12,0,0">
+                <DockPanel LastChildFill="True">
+                    <ToggleButton x:Name="CompatSwitch" DockPanel.Dock="Right" Margin="12,0,0,0"
+                                  Style="{StaticResource SwitchToggle}"
+                                  AutomationProperties.Name="검증되지 않은 한글 버전에도 시도" />
+                    <StackPanel>
+                        <TextBlock Text="검증되지 않은 한글 버전에도 시도 (실험)" FontWeight="Bold" />
+                        <TextBlock Text="한글 2018·2020·2024 등에서 저장 형식 변환 코드 구조가 같을 때만 적용합니다. 중요한 문서는 먼저 백업하고 저장 형식을 확인하세요."
+                                   Foreground="{StaticResource Muted}" Margin="0,3,0,0" TextWrapping="Wrap" />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+            <Border Background="White" BorderBrush="#D9E1EB" BorderThickness="1" CornerRadius="12"
                     Padding="19,15" Margin="0,12,0,0">
                 <StackPanel>
                     <TextBlock Text="런처 없이 바로 실행 (관리자 권한 불필요)" FontWeight="Bold" />
@@ -143,6 +157,8 @@
                         IsEnabled="False" Style="{StaticResource LauncherButton}" Background="{StaticResource Blue}"
                         BorderBrush="{StaticResource Blue}" Foreground="White" FontWeight="Bold" />
                 <Button x:Name="ScanButton" Content="다시 찾기" Click="Scan_Click"
+                        Style="{StaticResource LauncherButton}" Margin="9,0,0,0" />
+                <Button x:Name="UpdateButton" Content="업데이트 확인" Click="Update_Click"
                         Style="{StaticResource LauncherButton}" Margin="9,0,0,0" />
             </StackPanel>
             <Border Background="#E9EFF8" CornerRadius="8" Padding="13" Margin="0,16,0,0">

@@ -11,15 +11,27 @@ const CLSID CLSID_HwpSaveHookProfiler =
     { 0xE72ECB74, 0x8EC7, 0x43AE, { 0xB9, 0xF1, 0xC0, 0x3C, 0xAC, 0x1C, 0xAC, 0xD3 } };
 // clang-format on
 
-// 대상 식별값은 지원 빌드에만 유효하다. 다른 빌드는 런처의 해시 게이트가 먼저 막고,
-// 프로파일러도 모듈 식별로 이중 확인한다.
-const mdMethodDef TARGET_METHOD_TOKEN = 0x06000244;
-
-// Verified build identity. See docs/superpowers/specs/2026-11-26-hwp-save-hook-design.md.
+// 대상 메서드: instance bool Hwp.HwpFrame::ConvertToHwpxPath(ref string, ref string)
+// 토큰은 빌드마다 달라질 수 있어 이름과 시그니처로 찾는다.
 #define TARGET_MODULE_BASENAME L"Hwp.exe"
-constexpr GUID TARGET_MODULE_MVID =
-    { 0x065AAA74, 0x990A, 0x4F2E, { 0xAF, 0x36, 0x49, 0x53, 0xDE, 0xF7, 0x47, 0xEE } };
+#define TARGET_TYPE_NAME L"Hwp.HwpFrame"
+#define TARGET_METHOD_NAME L"ConvertToHwpxPath"
 constexpr BYTE TARGET_METHOD_SIGNATURE[] = {
     IMAGE_CEE_CS_CALLCONV_HASTHIS, 2, ELEMENT_TYPE_BOOLEAN,
     ELEMENT_TYPE_BYREF, ELEMENT_TYPE_STRING, ELEMENT_TYPE_BYREF, ELEMENT_TYPE_STRING
 };
+
+// 실기 검증한 빌드. 런처의 HwpBuildCatalog.Verified와 같은 값을 유지한다.
+// verified 모드에서는 모듈 MVID와 찾은 토큰이 이 표의 한 행과 모두 일치해야 한다.
+struct VerifiedTarget
+{
+    GUID mvid;
+    mdMethodDef token;
+};
+
+// clang-format off
+constexpr VerifiedTarget VERIFIED_TARGETS[] = {
+    // 한글 2022 교육기관용 12.0.0.4645 x86
+    { { 0x065AAA74, 0x990A, 0x4F2E, { 0xAF, 0x36, 0x49, 0x53, 0xDE, 0xF7, 0x47, 0xEE } }, 0x06000244 },
+};
+// clang-format on

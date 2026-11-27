@@ -73,9 +73,28 @@ try
 }
 catch (...) { /* Diagnostics must not throw into the CLR. */ }
 
-static void LogRejitState(const char* state)
+static void LogRejitState(mdMethodDef token, const char* state)
 {
-    Log("ReJITState: token=0x%08lX state=%s", (ULONG)TARGET_METHOD_TOKEN, state);
+    Log("ReJITState: token=0x%08lX state=%s", (ULONG)token, state);
+}
+
+// 런처가 전달한 대상 설정. 없으면 verified 모드(검증된 빌드만)로 동작한다.
+static bool ReadCompatibleMode()
+{
+    WCHAR value[32]{};
+    const DWORD count = GetEnvironmentVariableW(L"HWP_SAVEHOOK_TARGET_MODE", value, ARRAYSIZE(value));
+    return count > 0 && count < ARRAYSIZE(value) && _wcsicmp(value, L"compatible") == 0;
+}
+
+static mdMethodDef ReadExpectedToken()
+{
+    WCHAR value[32]{};
+    const DWORD count = GetEnvironmentVariableW(L"HWP_SAVEHOOK_TARGET_TOKEN", value, ARRAYSIZE(value));
+    if (count == 0 || count >= ARRAYSIZE(value)) return mdTokenNil;
+    WCHAR* end = nullptr;
+    const unsigned long token = wcstoul(value, &end, 16);
+    if (end == value || *end != L'\0' || TypeFromToken(token) != mdtMethodDef) return mdTokenNil;
+    return static_cast<mdMethodDef>(token);
 }
 
 // ----------------------------------------------------------------------------
@@ -122,6 +141,9 @@ public:
         const WCHAR* separator = wcsrchr(m_executable, L'\\');
         if (_wcsicmp(separator ? separator + 1 : m_executable, TARGET_MODULE_BASENAME) != 0) return S_OK;
 
+        m_compatibleMode = ReadCompatibleMode();
+        m_expectedToken = ReadExpectedToken();
+
         HRESULT hr = runtime->QueryInterface(__uuidof(ICorProfilerInfo4), (void**)&m_info);
         if (FAILED(hr))
         {
@@ -141,7 +163,8 @@ public:
             COR_PRF_DISABLE_INLINING | COR_PRF_ENABLE_REJIT | COR_PRF_DISABLE_ALL_NGEN_IMAGES;
         hr = info5->SetEventMask2(mask, 0);
         info5->Release();
-        Log("Initialize: SetEventMask2(0x%08lX, 0) hr=0x%08lX.", mask, (ULONG)hr);
+        Log("Initialize: SetEventMask2(0x%08lX, 0) hr=0x%08lX mode=%s expectedToken=0x%08lX.", mask, (ULONG)hr,
+            m_compatibleMode ? "compatible" : "verified", (ULONG)m_expectedToken);
         return hr;
     }
 
@@ -161,8 +184,8 @@ public:
 
         ModuleID empty = 0;
         if (!m_targetModule.compare_exchange_strong(empty, moduleId)) return S_OK;
-        Log("ModuleLoadFinished: verified target module (moduleId=%p).",
-            (void*)moduleId);
+        Log("ModuleLoadFinished: verified target module (moduleId=%p token=0x%08lX mode=%s).",
+            (void*)moduleId, (ULONG)m_targetToken.load(), m_compatibleMode ? "compatible" : "verified");
 
         // RequestReJIT may suspend the CLR. Return from this callback without waiting for it.
         AddRef();
@@ -177,7 +200,7 @@ public:
             m_targetModule.store(0);
             Release();
             Log("ModuleLoadFinished: could not create ReJIT worker (error=%lu).", error);
-            LogRejitState("failed");
+            LogRejitState(m_targetToken.load(), "failed");
         }
         return S_OK;
     }
@@ -211,7 +234,7 @@ public:
         const HRESULT hr = control->SetILFunctionBody(sizeof(body), body);
         Log("GetReJITParameters: SetILFunctionBody for token 0x%08lX hr=0x%08lX.",
             (ULONG)methodId, (ULONG)hr);
-        LogRejitState(SUCCEEDED(hr) ? "il-installed" : "failed");
+        LogRejitState(methodId, SUCCEEDED(hr) ? "il-installed" : "failed");
         return hr;
     }
 
@@ -230,7 +253,7 @@ public:
         if (IsTargetFunction(functionId))
         {
             Log("ReJITCompilationFinished: target rejitId=%p hr=0x%08lX.", (void*)rejitId, (ULONG)status);
-            LogRejitState(SUCCEEDED(status) ? "compiled" : "failed");
+            LogRejitState(m_targetToken.load(), SUCCEEDED(status) ? "compiled" : "failed");
         }
         return S_OK;
     }
@@ -242,7 +265,7 @@ public:
         {
             Log("ReJITError: target moduleId=%p functionId=%p hr=0x%08lX.",
                 (void*)moduleId, (void*)functionId, (ULONG)status);
-            LogRejitState("failed");
+            LogRejitState(methodId, "failed");
         }
         return S_OK;
     }
@@ -338,7 +361,7 @@ public:
     HRESULT STDMETHODCALLTYPE ProfilerDetachSucceeded() override { return S_OK; }
 
 private:
-    bool VerifyTarget(ModuleID moduleId) const
+    bool VerifyTarget(ModuleID moduleId)
     {
         WCHAR path[1024];
         ULONG length = 0;
@@ -362,22 +385,49 @@ private:
         }
 
         GUID mvid{};
-        PCCOR_SIGNATURE signature = nullptr;
-        ULONG signatureSize = 0;
-        const bool verified = metadata->GetScopeProps(nullptr, 0, nullptr, &mvid) == S_OK &&
-            mvid == TARGET_MODULE_MVID &&
-            metadata->GetMethodProps(TARGET_METHOD_TOKEN, nullptr, nullptr, 0, nullptr, nullptr,
-                &signature, &signatureSize, nullptr, nullptr) == S_OK &&
-            signature && signatureSize == sizeof(TARGET_METHOD_SIGNATURE) &&
-            std::memcmp(signature, TARGET_METHOD_SIGNATURE, signatureSize) == 0;
+        mdTypeDef type = mdTypeDefNil;
+        mdMethodDef method = mdMethodDefNil;
+        const bool found = metadata->GetScopeProps(nullptr, 0, nullptr, &mvid) == S_OK &&
+            metadata->FindTypeDefByName(TARGET_TYPE_NAME, mdTokenNil, &type) == S_OK &&
+            metadata->FindMethod(type, TARGET_METHOD_NAME, TARGET_METHOD_SIGNATURE,
+                sizeof(TARGET_METHOD_SIGNATURE), &method) == S_OK;
         metadata->Release();
-        if (!verified) Log("ModuleLoadFinished: Hwp.exe MVID or target signature mismatch.");
+        if (!found)
+        {
+            Log("ModuleLoadFinished: Hwp.exe target method not found (type or signature differs).");
+            return false;
+        }
+
+        bool verified = false;
+        if (m_compatibleMode)
+        {
+            // 검증되지 않은 빌드: 런처가 같은 파일에서 찾은 토큰과 일치해야 한다.
+            verified = m_expectedToken != mdTokenNil && method == m_expectedToken;
+            if (!verified)
+            {
+                Log("ModuleLoadFinished: compatible mode token mismatch (found=0x%08lX expected=0x%08lX).",
+                    (ULONG)method, (ULONG)m_expectedToken);
+            }
+        }
+        else
+        {
+            for (const VerifiedTarget& target : VERIFIED_TARGETS)
+            {
+                if (mvid == target.mvid && method == target.token)
+                {
+                    verified = true;
+                    break;
+                }
+            }
+            if (!verified) Log("ModuleLoadFinished: Hwp.exe MVID or target token is not in the verified list.");
+        }
+        if (verified) m_targetToken.store(method);
         return verified;
     }
 
     bool IsTarget(ModuleID moduleId, mdToken token) const
     {
-        return moduleId != 0 && moduleId == m_targetModule.load() && token == TARGET_METHOD_TOKEN;
+        return moduleId != 0 && moduleId == m_targetModule.load() && token == m_targetToken.load();
     }
 
     bool IsTargetFunction(FunctionID functionId) const
@@ -395,7 +445,7 @@ private:
         ModuleID moduleId = profiler->m_targetModule.load();
         if (moduleId)
         {
-            mdMethodDef method = TARGET_METHOD_TOKEN;
+            mdMethodDef method = profiler->m_targetToken.load();
             ICorProfilerInfo4* info = profiler->m_info;
             const HRESULT hr = info->InitializeCurrentThread();
             if (SUCCEEDED(hr))
@@ -403,12 +453,12 @@ private:
                 const HRESULT request = info->RequestReJIT(1, &moduleId, &method);
                 Log("RequestReJIT: target moduleId=%p token=0x%08lX hr=0x%08lX.",
                     (void*)moduleId, (ULONG)method, (ULONG)request);
-                LogRejitState(request == S_OK ? "request-accepted" : "failed");
+                LogRejitState(method, request == S_OK ? "request-accepted" : "failed");
             }
             else
             {
                 Log("RequestReJIT: InitializeCurrentThread failed, hr=0x%08lX.", (ULONG)hr);
-                LogRejitState("failed");
+                LogRejitState(method, "failed");
             }
         }
         profiler->Release();
@@ -418,6 +468,9 @@ private:
     LONG m_refCount = 1;
     ICorProfilerInfo4* m_info = nullptr;
     std::atomic<ModuleID> m_targetModule{0};
+    std::atomic<mdMethodDef> m_targetToken{mdMethodDefNil};
+    bool m_compatibleMode = false;
+    mdMethodDef m_expectedToken = mdTokenNil;
     WCHAR m_executable[1024]{};
 };
 

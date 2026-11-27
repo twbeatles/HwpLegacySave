@@ -26,9 +26,11 @@ public static class RejitLog
         return Path.Combine(folder, $"hwp-{Guid.NewGuid():N}.log");
     }
 
-    internal static RejitStatus ReadStatus(IEnumerable<string> lines, int processId)
+    internal static RejitStatus ReadStatus(IEnumerable<string> lines, int processId,
+        int targetToken = SaveHookLauncher.DefaultTargetToken)
     {
-        string marker = $" [pid {processId.ToString(CultureInfo.InvariantCulture)}] ReJITState: token=0x06000244 state=";
+        string token = targetToken.ToString("X8", CultureInfo.InvariantCulture);
+        string marker = $" [pid {processId.ToString(CultureInfo.InvariantCulture)}] ReJITState: token=0x{token} state=";
         var status = RejitStatus.NotObserved;
         bool installed = false;
         foreach (string line in lines)
@@ -55,7 +57,8 @@ public static class RejitLog
     }
 
     public static async Task<RejitStatus> WaitAsync(Process process, string log, bool waitForCompilation,
-        TimeSpan? timeout, CancellationToken cancellationToken = default)
+        TimeSpan? timeout, CancellationToken cancellationToken = default,
+        int targetToken = SaveHookLauncher.DefaultTargetToken)
     {
         var elapsed = Stopwatch.StartNew();
         int processId = process.Id;
@@ -64,7 +67,7 @@ public static class RejitLog
             cancellationToken.ThrowIfCancellationRequested();
             RejitStatus status = await Task.Run(() =>
             {
-                try { return ReadStatus(File.ReadAllLines(log), processId); }
+                try { return ReadStatus(File.ReadAllLines(log), processId, targetToken); }
                 catch (IOException) { return RejitStatus.NotObserved; }
             }, cancellationToken).ConfigureAwait(false);
 

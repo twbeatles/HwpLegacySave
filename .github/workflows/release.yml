@@ -1,0 +1,87 @@
+name: Release
+
+# v* 태그를 올리면 배포 ZIP을 빌드하고, 서명된 업데이트 매니페스트를 릴리스와 main의 updates/latest.json에 게시한다.
+# 필요한 저장소 Secret: HWPSAVEHOOK_UPDATE_PRIVATE_KEY (hwp-save-hook update-keygen이 만든 PKCS#8 base64)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-manifest-publication
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      HWPSAVEHOOK_UPDATE_PRIVATE_KEY: ${{ secrets.HWPSAVEHOOK_UPDATE_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build and test
+        shell: pwsh
+        run: |
+          if (-not $env:HWPSAVEHOOK_UPDATE_PRIVATE_KEY) { throw "HWPSAVEHOOK_UPDATE_PRIVATE_KEY secret is required" }
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Tag must use vX.Y.Z: ${{ github.ref_name }}" }
+          [xml]$props = Get-Content private/save-hook/Directory.Build.props
+          $configured = $props.Project.PropertyGroup.Version
+          if ($configured -ne $version) { throw "Tag $version does not match Directory.Build.props Version $configured" }
+          powershell.exe -NoProfile -File ./Build-Local.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Build-Local.ps1 failed ($LASTEXITCODE)" }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Package and sign
+        shell: pwsh
+        run: |
+          $dist = 'private/save-hook/dist/win-x64'
+          $smoke = Start-Process -FilePath "$dist/HwpSaveHook.exe" -ArgumentList '--smoke' -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) { throw "Smoke check failed ($($smoke.ExitCode))" }
+          $zip = Join-Path $env:RUNNER_TEMP 'HwpSaveHook-win-x64.zip'
+          Compress-Archive -Path "$dist/*" -DestinationPath $zip -CompressionLevel Optimal
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$env:VERSION/HwpSaveHook-win-x64.zip"
+          $cli = 'private/save-hook/launcher/bin/Release/net10.0-windows/win-x64/hwp-save-hook.dll'
+          dotnet $cli update-sign --version $env:VERSION --artifact $zip --url $url --out "$env:RUNNER_TEMP/latest.json"
+          if ($LASTEXITCODE -ne 0) { throw "Manifest signing failed ($LASTEXITCODE)" }
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ env.VERSION }} - 한글 HWP 저장 런처
+          files: |
+            ${{ env.ZIP }}
+            ${{ runner.temp }}/latest.json
+
+      - name: Publish latest manifest on main
+        shell: pwsh
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Release tag commit must be contained in main before publishing latest manifest" }
+          git checkout -B main origin/main
+          New-Item -ItemType Directory -Force updates | Out-Null
+          Copy-Item -LiteralPath "$env:RUNNER_TEMP/latest.json" -Destination updates/latest.json -Force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add updates/latest.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          git commit -m "chore: publish update manifest for ${{ github.ref_name }} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main

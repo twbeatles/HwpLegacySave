@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
@@ -463,6 +464,216 @@ if (args is ["--cli", string dotnet, string cli])
         try { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testRegistryRoot, throwOnMissingSubKey: false); } catch { /* best effort */ }
         try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
     }
+}
+
+// --- 버전 호환: 실행 파일 구조 판정 ---
+{
+    HwpBuildInfo native = HwpBuildInspector.Inspect(Environment.ProcessPath!);
+    Check("inspect: native apphost is classified as native", native.Kind == HwpBuildKind.Native && !native.HasCompatibleTarget);
+
+    HwpBuildInfo anyCpu = HwpBuildInspector.Inspect(typeof(SaveHookLauncher).Assembly.Location);
+    Check("inspect: managed AnyCPU library has no target and is not x86-only",
+        anyCpu.Kind == HwpBuildKind.Managed && anyCpu.TargetToken is null && !anyCpu.IsX86 && anyCpu.Mvid is not null);
+
+    Check("inspect: garbage bytes are unreadable",
+        HwpBuildInspector.InspectImage([0x4D, 0x5A, 0x00]).Kind == HwpBuildKind.Unreadable);
+
+    Check("inspect: product names follow the HOffice major version",
+        HwpBuildInspector.DescribeProduct("10.0.0.1") == "한글 2018" &&
+        HwpBuildInspector.DescribeProduct("11.0.0.2") == "한글 2020" &&
+        HwpBuildInspector.DescribeProduct("12.0.0.4645") == "한글 2022" &&
+        HwpBuildInspector.DescribeProduct("13.0.0.100") == "한글 2024");
+
+    // 실제 한글 2022가 설치된 PC에서는 실기 빌드로 카탈로그 값을 교차 확인한다.
+    string installed = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+        "HNC", "Office 2022", "HOffice120", "Bin", "Hwp.exe");
+    KnownHwpBuild verified = HwpBuildCatalog.Verified[0];
+    if (File.Exists(installed) && string.Equals(SaveHookLauncher.TryHashFile(installed), verified.Sha256, StringComparison.OrdinalIgnoreCase))
+    {
+        HwpBuildInfo real = HwpBuildInspector.Inspect(installed);
+        Check("inspect: installed Hangul 2022 matches the catalog MVID and token",
+            real.HasCompatibleTarget && real.Mvid == verified.Mvid && real.TargetToken == verified.TargetToken);
+        LaunchPlan realPlan = SaveHookLauncher.CreatePlan(installed, Environment.ProcessPath!, SaveHookLauncher.ProfilerClsid,
+            ClrKind.NetFramework, SaveHookLauncher.DefaultExpectedSha256);
+        Check("plan: verified build uses verified mode and catalog token",
+            realPlan.Hooked && realPlan.TargetMode == TargetMode.Verified &&
+            realPlan.ProfilerEnvironment[SaveHookLauncher.TargetModeVariable] == "verified" &&
+            realPlan.ProfilerEnvironment[SaveHookLauncher.TargetTokenVariable] == "0x06000244");
+    }
+    else
+    {
+        Console.WriteLine("  SKIP  inspect: Hangul 2022 12.0.0.4645 is not installed");
+    }
+
+    var compatible = new HwpBuildInfo(HwpBuildKind.Managed, "13.0.0.1", "한글 2024", true, Guid.NewGuid(), "v4.0.30319", 0x06000250, null);
+    Check("structure: compatible build needs opt-in",
+        SaveHookLauncher.EvaluateStructure(compatible, "AA", allowCompatible: false) is
+            { Decision: HookDecision.RunWithoutHook, Reason: "compatible-needs-opt-in" });
+    Check("structure: compatible build hooks after opt-in",
+        SaveHookLauncher.EvaluateStructure(compatible, "AA", allowCompatible: true) is
+            { Decision: HookDecision.Hook, Reason: "compatible-signature" });
+    Check("structure: native build is never hooked",
+        SaveHookLauncher.EvaluateStructure(compatible with { Kind = HwpBuildKind.Native, TargetToken = null }, "AA", true) is
+            { Decision: HookDecision.RunWithoutHook, Reason: "native-build-unsupported" });
+    Check("structure: managed build without the method is not hooked",
+        SaveHookLauncher.EvaluateStructure(compatible with { TargetToken = null }, "AA", true) is
+            { Reason: "target-not-found" });
+    Check("structure: AnyCPU build is not hooked by the x86 profiler",
+        SaveHookLauncher.EvaluateStructure(compatible with { IsX86 = false }, "AA", true) is
+            { Reason: "target-not-found" });
+
+    const int pid = 77;
+    string line = $"2026-11-27 10:00:00.000 [pid {pid}] ReJITState: token=0x06000250 state=";
+    Check("ReJIT: custom target token is tracked",
+        RejitLog.ReadStatus([line + "il-installed", line + "compiled"], pid, 0x06000250) == RejitStatus.Applied &&
+        RejitLog.ReadStatus([line + "il-installed", line + "compiled"], pid) == RejitStatus.NotObserved);
+
+    string settings = NewTempDir();
+    try
+    {
+        Check("settings: compatible mode defaults to off", !SaveHookSettings.ReadCompatibleEnabled(settings));
+        SaveHookSettings.WriteCompatibleEnabled(true, settings);
+        Check("settings: compatible mode persists", SaveHookSettings.ReadCompatibleEnabled(settings));
+    }
+    finally
+    {
+        try { Directory.Delete(settings, recursive: true); } catch { /* best effort */ }
+    }
+}
+
+// --- 업데이터: 서명 매니페스트 ---
+{
+    using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+    ECParameters parameters = key.ExportParameters(false);
+    string publicKey = Convert.ToBase64String([.. parameters.Q.X!, .. parameters.Q.Y!]);
+    string sha = new string('a', 64);
+    string Manifest(string version = "9.0.0", string url = "https://example.invalid/a.zip", string expires = "2099-01-01T00:00:00Z",
+        long size = 100, string? signVersion = null)
+    {
+        byte[] payload = UpdateManifestVerifier.CanonicalPayload(signVersion ?? version, url, sha, size, expires);
+        string signature = Convert.ToBase64String(key.SignData(payload, HashAlgorithmName.SHA256));
+        return $"{{\"version\":\"{version}\",\"artifact_url\":\"{url}\",\"sha256\":\"{sha}\",\"size\":{size},\"expires_at\":\"{expires}\",\"signature\":\"{signature}\"}}";
+    }
+
+    var current = new Version(1, 2, 0);
+    UpdateManifest ok = UpdateManifestVerifier.Verify(Manifest(), publicKey, current);
+    Check("update: valid signed manifest is accepted", ok.Version == new Version(9, 0, 0) && ok.Size == 100);
+
+    bool Rejects<T>(Func<UpdateManifest> verify) where T : Exception
+    {
+        try { verify(); return false; }
+        catch (T) { return true; }
+    }
+    Check("update: tampered version fails the signature",
+        Rejects<CryptographicException>(() => UpdateManifestVerifier.Verify(Manifest(version: "9.0.1", signVersion: "9.0.0"), publicKey, current)));
+    Check("update: same version is not an update",
+        Rejects<NoUpdateAvailableException>(() => UpdateManifestVerifier.Verify(Manifest(version: "1.2"), publicKey, current)));
+    Check("update: expired manifest is rejected",
+        Rejects<FormatException>(() => UpdateManifestVerifier.Verify(Manifest(expires: "2000-01-01T00:00:00Z"), publicKey, current)));
+    Check("update: HTTP artifact is rejected even when signed",
+        Rejects<FormatException>(() => UpdateManifestVerifier.Verify(Manifest(url: "http://example.invalid/a.zip"), publicKey, current)));
+    using var other = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+    ECParameters otherParameters = other.ExportParameters(false);
+    Check("update: another key's public key rejects the manifest",
+        Rejects<CryptographicException>(() => UpdateManifestVerifier.Verify(Manifest(),
+            Convert.ToBase64String([.. otherParameters.Q.X!, .. otherParameters.Q.Y!]), current)));
+    Check("update: duplicate JSON keys are rejected",
+        Rejects<FormatException>(() => UpdateManifestVerifier.Verify(
+            Manifest().Replace("{\"version\"", "{\"version\":\"9.9.9\",\"version\""), publicKey, current)));
+    Check("update: shipped build carries an update public key", UpdateInstaller.IsConfigured);
+}
+
+// --- 업데이터: 패키지 검사와 파일 교체·롤백 ---
+{
+    string dir = NewTempDir();
+    try
+    {
+        string MakeZip(string name, params (string Path, string Text)[] entries)
+        {
+            string path = Path.Combine(dir, name);
+            using var zip = ZipFile.Open(path, ZipArchiveMode.Create);
+            foreach (var (entryPath, text) in entries)
+            {
+                using var writer = new StreamWriter(zip.CreateEntry(entryPath).Open());
+                writer.Write(text);
+            }
+            return path;
+        }
+
+        var complete = new[] { ("HwpSaveHook.exe", "new-exe"), ("HwpSaveHook.exe.config", "new-config"),
+            ("profiler/HwpSaveHookProfiler.dll", "new-dll"), ("LICENSE", "new-license") };
+        string good = MakeZip("good.zip", complete);
+        string payload = Path.Combine(dir, "payload");
+        UpdateInstaller.ExtractPackage(good, payload);
+        Check("package: valid ZIP extracts all files", File.ReadAllText(Path.Combine(payload, "profiler", "HwpSaveHookProfiler.dll")) == "new-dll");
+
+        bool ExtractFails(string zip)
+        {
+            try { UpdateInstaller.ExtractPackage(zip, Path.Combine(dir, "x-" + Guid.NewGuid().ToString("N"))); return false; }
+            catch (InvalidDataException) { return true; }
+        }
+        Check("package: path traversal is rejected",
+            ExtractFails(MakeZip("evil.zip", [.. complete, ("../escape.txt", "x")])));
+        Check("package: missing profiler DLL is rejected",
+            ExtractFails(MakeZip("partial.zip", ("HwpSaveHook.exe", "a"), ("HwpSaveHook.exe.config", "b"))));
+
+        string artifact = Path.Combine(dir, "artifact.bin");
+        File.WriteAllText(artifact, "artifact");
+        string artifactHash = SaveHookLauncher.TryHashFile(artifact)!;
+        Check("package: matching hash and size pass", Try(() => UpdateInstaller.VerifyArtifact(artifact, artifactHash, 8)));
+        Check("package: wrong hash fails", !Try(() => UpdateInstaller.VerifyArtifact(artifact, new string('0', 64), 8)));
+
+        string install = Path.Combine(dir, "install");
+        Directory.CreateDirectory(Path.Combine(install, "profiler"));
+        void SeedInstall()
+        {
+            File.WriteAllText(Path.Combine(install, "HwpSaveHook.exe"), "old-exe");
+            File.WriteAllText(Path.Combine(install, "HwpSaveHook.exe.config"), "old-config");
+            File.WriteAllText(Path.Combine(install, "profiler", "HwpSaveHookProfiler.dll"), "old-dll");
+            File.WriteAllText(Path.Combine(install, "user-note.txt"), "keep");
+            if (File.Exists(Path.Combine(install, "LICENSE"))) File.Delete(Path.Combine(install, "LICENSE"));
+        }
+
+        SeedInstall();
+        UpdateResult failed = UpdateInstaller.ReplaceFiles(payload, install, "9.0.0", _ => false);
+        Check("apply: failed smoke check rolls back every file",
+            failed.Status == "rolled-back" &&
+            File.ReadAllText(Path.Combine(install, "HwpSaveHook.exe")) == "old-exe" &&
+            File.ReadAllText(Path.Combine(install, "profiler", "HwpSaveHookProfiler.dll")) == "old-dll" &&
+            !File.Exists(Path.Combine(install, "LICENSE")) &&
+            Directory.GetDirectories(install, ".update-backup-*").Length == 0 &&
+            Directory.GetFiles(install, "*.update-*", SearchOption.AllDirectories).Length == 0);
+
+        string? smoked = null;
+        UpdateResult applied = UpdateInstaller.ReplaceFiles(payload, install, "9.0.0", exe => { smoked = exe; return true; });
+        Check("apply: successful update replaces files and keeps unrelated ones",
+            applied.Status == "applied" &&
+            File.ReadAllText(Path.Combine(install, "HwpSaveHook.exe")) == "new-exe" &&
+            File.ReadAllText(Path.Combine(install, "profiler", "HwpSaveHookProfiler.dll")) == "new-dll" &&
+            File.ReadAllText(Path.Combine(install, "user-note.txt")) == "keep" &&
+            Directory.GetDirectories(install, ".update-backup-*").Length == 0);
+        Check("apply: smoke check runs the installed launcher", smoked == Path.Combine(install, "HwpSaveHook.exe"));
+
+        string staging = Path.Combine(dir, "updates");
+        Check("apply: only Stage work folders are cleaned after success",
+            UpdateInstaller.StagedWorkDirectory(Path.Combine(staging, "update-9.0.0-ab", "payload"), staging)
+                == Path.Combine(staging, "update-9.0.0-ab") &&
+            UpdateInstaller.StagedWorkDirectory(payload, staging) is null &&
+            UpdateInstaller.StagedWorkDirectory(Path.Combine(dir, "update-x", "payload"), staging) is null);
+
+        Check("apply: helper arguments survive spaces and trailing backslashes",
+            UpdateInstaller.QuoteArgument(@"C:\Program Files\Hwp\") == "\"C:\\Program Files\\Hwp\\\\\"");
+    }
+    finally
+    {
+        try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+    }
+}
+
+static bool Try(Action action)
+{
+    try { action(); return true; }
+    catch (InvalidDataException) { return false; }
 }
 
 Console.WriteLine();

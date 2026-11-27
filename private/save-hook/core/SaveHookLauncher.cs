@@ -41,6 +41,37 @@ public enum ClrKind
 /// <summary>해시 게이트 판정 결과.</summary>
 public sealed record GateResult(HookDecision Decision, string Reason, string? ActualSha256);
 
+/// <summary>
+/// 프로파일러가 대상 메서드를 확인하는 방식.
+/// Verified: 카탈로그의 MVID·토큰과 정확히 일치해야 한다.
+/// Compatible: 이름·시그니처로 찾은 메서드가 런처가 분석한 토큰과 같으면 적용한다(검증되지 않은 빌드).
+/// </summary>
+public enum TargetMode
+{
+    Verified,
+    Compatible,
+}
+
+/// <summary>실기 검증을 마친 한글 빌드.</summary>
+public sealed record KnownHwpBuild(string Sha256, string Product, string FileVersion, Guid Mvid, int TargetToken);
+
+/// <summary>
+/// 검증된 빌드 목록. 새 빌드를 추가하면 profiler/Target.h의 VERIFIED_TARGETS에도 같은 MVID·토큰을 넣는다.
+/// 값은 `hwp-save-hook inspect --hwp PATH`로 얻는다.
+/// </summary>
+public static class HwpBuildCatalog
+{
+    public static IReadOnlyList<KnownHwpBuild> Verified { get; } =
+    [
+        new("8211F34ED67E169C7A957A91BBACB6AA0DED64F642C3E5B112B1EA56CD6BCDD4",
+            "한글 2022 교육기관용", "12.0.0.4645",
+            new Guid("065aaa74-990a-4f2e-af36-4953def747ee"), 0x06000244),
+    ];
+
+    public static KnownHwpBuild? Find(string? sha256) => sha256 is null ? null
+        : Verified.FirstOrDefault(build => string.Equals(build.Sha256, sha256, StringComparison.OrdinalIgnoreCase));
+}
+
 /// <summary>실행 계획(프로세스를 띄우기 전의 전체 결정). dry-run으로 그대로 출력 가능.</summary>
 public sealed record LaunchPlan(
     string HwpPath,
@@ -50,7 +81,20 @@ public sealed record LaunchPlan(
     string Clsid,
     string? ActualSha256,
     string ExpectedSha256,
-    IReadOnlyDictionary<string, string> ProfilerEnvironment);
+    IReadOnlyDictionary<string, string> ProfilerEnvironment)
+{
+    /// <summary>실행 파일 구조 분석 결과. 해시가 검증 목록에 있으면 분석을 생략한다.</summary>
+    public HwpBuildInfo? Build { get; init; }
+
+    /// <summary>후킹 시 프로파일러가 쓰는 확인 방식.</summary>
+    public TargetMode TargetMode { get; init; } = TargetMode.Verified;
+
+    /// <summary>ReJIT 대상 메서드 토큰. 실행 로그의 상태 판정에도 쓴다.</summary>
+    public int TargetToken { get; init; } = SaveHookLauncher.DefaultTargetToken;
+
+    /// <summary>사람이 읽는 빌드 이름(예: "한글 2022 교육기관용 12.0.0.4645").</summary>
+    public string? BuildLabel { get; init; }
+}
 
 /// <summary>투명 실행(--open) 결과.</summary>
 public sealed record TransparentLaunchResult(Process Process, bool AttachedProfiler);
@@ -60,6 +104,12 @@ public static class SaveHookLauncher
     /// <summary>지원 빌드. 한컴오피스 2022 한글 교육기관용 12.0.0.4645 x86.</summary>
     public const string DefaultExpectedSha256 =
         "8211f34ed67e169c7a957a91bbacb6aa0ded64f642c3e5b112b1ea56cd6bcdd4";
+
+    /// <summary>지원 빌드의 대상 메서드 토큰(Hwp.HwpFrame::ConvertToHwpxPath).</summary>
+    public const int DefaultTargetToken = 0x06000244;
+
+    public const string TargetModeVariable = "HWP_SAVEHOOK_TARGET_MODE";
+    public const string TargetTokenVariable = "HWP_SAVEHOOK_TARGET_TOKEN";
 
     /// <summary>프로파일러 COM 클래스 식별자. C++ 프로파일러의 CLSID와 반드시 일치해야 한다.</summary>
     public const string ProfilerClsid = "{E72ECB74-8EC7-43AE-B9F1-C03CAC1CACD3}";
@@ -138,28 +188,108 @@ public static class SaveHookLauncher
     }
 
     /// <summary>해시·프로파일러 존재·환경변수를 묶어 실행 계획을 만든다. 프로세스는 띄우지 않는다.</summary>
+    /// <param name="allowCompatible">
+    /// 검증 목록에 없지만 대상 메서드 구조가 같은 빌드(한글 2018·2020·2024 등)에도 적용할지 여부.
+    /// 사용자가 명시적으로 켰을 때만 true로 넘긴다.
+    /// </param>
     public static LaunchPlan CreatePlan(
         string hwpPath, string profilerDllPath, string clsid, ClrKind clrKind, string expectedSha256,
-        bool forceRunWithoutHook = false)
+        bool forceRunWithoutHook = false, bool allowCompatible = false)
     {
         string resolvedHwp = Path.GetFullPath(hwpPath);
         string resolvedProfiler = Path.GetFullPath(profilerDllPath);
         bool profilerExists = File.Exists(resolvedProfiler);
         string? actual = TryHashFile(resolvedHwp);
+        KnownHwpBuild? known = HwpBuildCatalog.Find(actual);
+        bool expectedMatch = actual is not null && string.Equals(actual, expectedSha256, StringComparison.OrdinalIgnoreCase);
 
-        GateResult gate = forceRunWithoutHook
-            ? new GateResult(HookDecision.RunWithoutHook, "forced-no-hook", actual)
-            : EvaluateGate(actual, profilerExists, expectedSha256);
+        // 검증된 빌드는 카탈로그 값을 쓰고, 그 밖에는 구조를 직접 읽는다.
+        HwpBuildInfo? build = known is null && actual is not null ? HwpBuildInspector.Inspect(resolvedHwp) : null;
+        string? label = known is not null ? $"{known.Product} {known.FileVersion}"
+            : build is null ? null
+            : string.Join(" ", new[] { build.ProductName, build.FileVersion }.Where(part => !string.IsNullOrEmpty(part)));
+
+        GateResult gate;
+        TargetMode mode = TargetMode.Verified;
+        int token = known?.TargetToken ?? build?.TargetToken ?? DefaultTargetToken;
+        if (forceRunWithoutHook)
+        {
+            gate = new GateResult(HookDecision.RunWithoutHook, "forced-no-hook", actual);
+        }
+        else if (!profilerExists)
+        {
+            gate = new GateResult(HookDecision.RunWithoutHook, "profiler-missing", actual);
+        }
+        else if (actual is null)
+        {
+            gate = new GateResult(HookDecision.RunWithoutHook, "hwp-unreadable", null);
+        }
+        else if (known is not null && (expectedMatch || IsDefaultExpected(expectedSha256)))
+        {
+            gate = new GateResult(HookDecision.Hook, "build-hash-match", actual);
+        }
+        else
+        {
+            // 검증 목록 밖의 빌드는 프로파일러도 이름·시그니처·토큰으로 다시 확인한다(compatible 모드).
+            // --expected-sha256로 직접 지정한 해시가 맞으면 개발자 확인으로 보고 구조 판정 없이 시도한다.
+            build ??= HwpBuildInspector.Inspect(resolvedHwp);
+            token = build.TargetToken ?? DefaultTargetToken;
+            gate = expectedMatch
+                ? new GateResult(HookDecision.Hook, "build-hash-match", actual)
+                : EvaluateStructure(build, actual, allowCompatible);
+            mode = TargetMode.Compatible;
+        }
 
         bool hooked = gate.Decision == HookDecision.Hook;
-        IReadOnlyDictionary<string, string> env = hooked
-            ? BuildProfilerEnvironment(resolvedProfiler, clsid, clrKind)
-            : new Dictionary<string, string>(StringComparer.Ordinal);
+        var env = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (hooked)
+        {
+            foreach (KeyValuePair<string, string> entry in BuildProfilerEnvironment(resolvedProfiler, clsid, clrKind))
+            {
+                env[entry.Key] = entry.Value;
+            }
+            env[TargetModeVariable] = mode == TargetMode.Compatible ? "compatible" : "verified";
+            env[TargetTokenVariable] = $"0x{token:X8}";
+        }
 
         return new LaunchPlan(
             resolvedHwp, hooked, gate.Reason,
             profilerExists ? resolvedProfiler : null,
-            clsid, actual, expectedSha256, env);
+            clsid, actual, expectedSha256, env)
+        {
+            Build = build,
+            TargetMode = mode,
+            TargetToken = token,
+            BuildLabel = string.IsNullOrWhiteSpace(label) ? null : label,
+        };
+    }
+
+    private static bool IsDefaultExpected(string expectedSha256) =>
+        string.Equals(expectedSha256, DefaultExpectedSha256, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 검증 목록에 없는 빌드의 구조 판정. 네이티브 빌드나 대상 메서드가 없는 빌드는 후킹하지 않는다.
+    /// 구조가 같아도 메서드의 의미가 바뀌었을 수 있으므로 사용자가 켠 경우에만 적용한다.
+    /// </summary>
+    public static GateResult EvaluateStructure(HwpBuildInfo? build, string? actual, bool allowCompatible)
+    {
+        if (build is null || build.Kind == HwpBuildKind.Unreadable)
+        {
+            return new(HookDecision.RunWithoutHook, "build-hash-mismatch", actual);
+        }
+        if (build.Kind == HwpBuildKind.Native)
+        {
+            return new(HookDecision.RunWithoutHook, "native-build-unsupported", actual);
+        }
+        if (!build.HasCompatibleTarget)
+        {
+            return new(HookDecision.RunWithoutHook, "target-not-found", actual);
+        }
+        if (allowCompatible)
+        {
+            return new(HookDecision.Hook, "compatible-signature", actual);
+        }
+        return new(HookDecision.RunWithoutHook, "compatible-needs-opt-in", actual);
     }
 
     /// <summary>
@@ -234,6 +364,10 @@ public static class SaveHookLauncher
                 startInfo.Environment.Remove($"{family}_{suffix}");
             }
         }
+        foreach (string name in new[] { TargetModeVariable, TargetTokenVariable, "HWP_SAVEHOOK_LOG" })
+        {
+            startInfo.Environment.Remove(name);
+        }
 
         if (applyProfiler)
         {
@@ -270,7 +404,7 @@ public static class SaveHookLauncher
         }
     }
 
-    private static bool IsHangulRunningInSession()
+    public static bool IsHangulRunningInSession()
     {
         using Process current = Process.GetCurrentProcess();
         int session = current.SessionId;

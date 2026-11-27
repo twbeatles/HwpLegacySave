@@ -16,6 +16,8 @@ public partial class MainWindow : Window
     private LaunchPlan? _plan;
     private string? _logPath;
     private bool _useHook;
+    private bool _allowCompatible;
+    private UpdateManifest? _pendingUpdate;
     private bool _busy;
     private bool _isUpdatingUi;
     private IntegrationStatus _shortcutState;
@@ -31,6 +33,9 @@ public partial class MainWindow : Window
         ModeSwitch.Unchecked += ModeChanged;
         AssocSwitch.Checked += AssocChanged;
         AssocSwitch.Unchecked += AssocChanged;
+        CompatSwitch.Checked += CompatChanged;
+        CompatSwitch.Unchecked += CompatChanged;
+        VersionText.Text = $"버전 {FormatVersion(UpdateInstaller.CurrentVersion)}";
         Activated += (_, _) =>
         {
             if (!_busy)
@@ -41,7 +46,19 @@ public partial class MainWindow : Window
         };
     }
 
-    private async void Window_Loaded(object sender, RoutedEventArgs e) => await Scan(restoreSelection: true);
+    private async void Window_Loaded(object sender, RoutedEventArgs e)
+    {
+        await Scan(restoreSelection: true);
+        UpdateResult? previous = UpdateInstaller.ConsumeResult();
+        if (previous is not null)
+        {
+            ActivityStatus.Text = previous.Status == "applied"
+                ? $"{previous.Version} 버전으로 업데이트했습니다."
+                : $"업데이트를 완료하지 못했습니다. {previous.Message}";
+            return;
+        }
+        await CheckForUpdate(userInitiated: false);
+    }
     private async void Scan_Click(object sender, RoutedEventArgs e) => await Scan();
 
     private async void Browse_Click(object sender, RoutedEventArgs e)
@@ -72,14 +89,7 @@ public partial class MainWindow : Window
             });
             _plan = plan;
             HwpPath.Text = _plan?.HwpPath ?? "";
-            string buildStatus = _plan?.Reason switch
-            {
-                "build-hash-match" => "한글 2022 12.0.0.4645 x86 · HWP 저장 사용 가능",
-                "profiler-missing" => "프로파일러 DLL이 없습니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
-                "build-hash-mismatch" => "다른 한글 빌드입니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
-                "hwp-unreadable" => "한글 실행 파일을 읽을 수 없습니다.",
-                _ => "한글 실행 파일을 찾지 못했습니다."
-            };
+            string buildStatus = DescribeBuild(_plan);
             BuildStatus.Text = _plan is null ? buildStatus : $"{(manual ? "직접 지정" : "자동 선택")} · {buildStatus}";
             ActivityStatus.Text = _plan is null
                 ? "찾아보기에서 설치 폴더의 Hwp.exe를 선택하세요."
@@ -95,6 +105,28 @@ public partial class MainWindow : Window
             }
         });
     }
+
+    private static string DescribeBuild(LaunchPlan? plan)
+    {
+        if (plan is null) return "한글 실행 파일을 찾지 못했습니다.";
+        string label = plan.BuildLabel ?? "알 수 없는 한글 빌드";
+        return plan.Reason switch
+        {
+            "build-hash-match" => $"{label} · 검증된 빌드 · HWP 저장 사용 가능",
+            "compatible-signature" => $"{label} · 검증되지 않은 빌드(실험) · 저장 형식 변환 코드 구조 일치",
+            "compatible-needs-opt-in" => $"{label} · 검증되지 않은 빌드입니다. 구조가 같아 아래 '검증되지 않은 한글 버전에도 시도'를 켜면 적용할 수 있습니다.",
+            "native-build-unsupported" => $"{label} · 이 버전의 Hwp.exe는 .NET 기반이 아니어서 이 방식으로 바꿀 수 없습니다. OFF로 일반 실행하세요.",
+            "target-not-found" => $"{label} · 저장 형식 변환 코드를 찾지 못해 지원하지 않습니다. OFF로 일반 실행하세요.",
+            "profiler-missing" => "프로파일러 DLL이 없습니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
+            "build-hash-mismatch" => "다른 한글 빌드입니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
+            "hwp-unreadable" => "한글 실행 파일을 읽을 수 없습니다.",
+            "forced-no-hook" => $"{label} · 일반 실행",
+            _ => label,
+        };
+    }
+
+    private static string FormatVersion(Version version) =>
+        version.Build > 0 || version.Revision <= 0 ? version.ToString(3) : version.ToString();
 
     private static string? ReadSelectedPath(CancellationToken token)
     {
@@ -120,6 +152,8 @@ public partial class MainWindow : Window
         {
             _useHook = SaveHookSettings.ReadHookEnabled();
             ModeSwitch.IsChecked = _useHook;
+            _allowCompatible = SaveHookSettings.ReadCompatibleEnabled();
+            CompatSwitch.IsChecked = _allowCompatible;
         }
         finally
         {
@@ -150,6 +184,135 @@ public partial class MainWindow : Window
             ActivityStatus.Text = $"실행 모드를 저장하지 못했습니다. {error.Message}";
         }
         UpdateButtons();
+    }
+
+    private async void CompatChanged(object sender, RoutedEventArgs e)
+    {
+        if (_isUpdatingUi) return;
+        bool selected = CompatSwitch.IsChecked == true;
+        if (selected == _allowCompatible) return;
+
+        try
+        {
+            SaveHookSettings.WriteCompatibleEnabled(selected);
+            _allowCompatible = selected;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _isUpdatingUi = true;
+            try { CompatSwitch.IsChecked = _allowCompatible; }
+            finally { _isUpdatingUi = false; }
+            ActivityStatus.Text = $"설정을 저장하지 못했습니다. {error.Message}";
+            return;
+        }
+
+        if (_plan is LaunchPlan current)
+        {
+            await RunOperation(async () =>
+            {
+                _plan = await HwpInstallations.InspectWithTimeoutAsync(_ => CreatePlan(current.HwpPath));
+                BuildStatus.Text = DescribeBuild(_plan);
+            });
+        }
+        ActivityStatus.Text = selected
+            ? "검증되지 않은 버전에도 시도합니다. 저장한 뒤 파일 형식을 꼭 확인하세요."
+            : "검증된 한글 빌드에서만 HWP 저장 모드를 사용합니다.";
+    }
+
+    private async void Update_Click(object sender, RoutedEventArgs e)
+    {
+        if (_pendingUpdate is null)
+        {
+            await CheckForUpdate(userInitiated: true);
+            return;
+        }
+        await InstallUpdate(_pendingUpdate);
+    }
+
+    private async Task CheckForUpdate(bool userInitiated)
+    {
+        if (!UpdateInstaller.IsConfigured)
+        {
+            if (userInitiated) ActivityStatus.Text = "이 빌드에는 업데이트 서명 키가 없어 자동 업데이트를 사용할 수 없습니다.";
+            return;
+        }
+
+        // 시작 시 자동 확인은 다른 버튼을 잠그지 않는다(오프라인이면 요청 시한까지 걸릴 수 있다).
+        Func<Func<Task>, Task> run = userInitiated ? RunOperation : action => action();
+        await run(async () =>
+        {
+            if (userInitiated) ActivityStatus.Text = "새 버전을 확인하는 중입니다.";
+            try
+            {
+                UpdateManifest? manifest = await Task.Run(() => UpdateInstaller.Check());
+                _pendingUpdate = manifest;
+                UpdateButton.Content = manifest is null ? "업데이트 확인" : $"{FormatVersion(manifest.Version)} 설치";
+                if (!userInitiated && _busy) return; // 진행 중인 작업의 안내 문구를 덮지 않는다.
+                if (manifest is not null)
+                {
+                    ActivityStatus.Text = $"새 버전 {FormatVersion(manifest.Version)}이 있습니다. '{UpdateButton.Content}'를 눌러 설치하세요.";
+                }
+                else if (userInitiated)
+                {
+                    ActivityStatus.Text = "현재 최신 버전입니다.";
+                }
+            }
+            catch (Exception error) when (!userInitiated && error is IOException or InvalidDataException or FormatException
+                                          or System.Security.Cryptography.CryptographicException or InvalidOperationException
+                                          or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                // 시작 시 자동 확인 실패는 조용히 넘긴다(오프라인 등).
+            }
+            catch (Exception error) when (error is InvalidDataException or FormatException
+                                          or System.Security.Cryptography.CryptographicException)
+            {
+                ActivityStatus.Text = $"업데이트 정보를 확인할 수 없습니다. {error.Message}";
+            }
+        });
+    }
+
+    private async Task InstallUpdate(UpdateManifest manifest)
+    {
+        string launcher = WindowsIntegration.GetCurrentLauncherExecutablePath();
+        string installDir = Path.GetDirectoryName(launcher)!;
+        if (!UpdateInstaller.CanWrite(installDir))
+        {
+            ActivityStatus.Text = "설치 폴더에 쓸 수 없어 자동 업데이트를 할 수 없습니다. 릴리스 페이지에서 새 ZIP을 받아 직접 교체하세요.";
+            OpenUrl(UpdateInstaller.ReleasesUrl);
+            return;
+        }
+
+        var answer = MessageBox.Show(this,
+            $"버전 {FormatVersion(manifest.Version)}을 내려받아 설치합니다.\n설치 중 런처가 닫혔다가 다시 열립니다. 열려 있는 한글은 먼저 저장하고 닫아 주세요.",
+            "한글 HWP 저장 런처 업데이트", MessageBoxButton.OKCancel, MessageBoxImage.Information);
+        if (answer != MessageBoxResult.OK) return;
+
+        bool launched = false;
+        await RunOperation(async () =>
+        {
+            if (SaveHookLauncher.IsHangulRunningInSession())
+            {
+                ActivityStatus.Text = "한글이 실행 중입니다. 문서를 저장하고 한글을 닫은 뒤 다시 시도하세요.";
+                return;
+            }
+            ActivityStatus.Text = "새 버전을 내려받는 중입니다.";
+            string payload = await Task.Run(() => UpdateInstaller.Stage(manifest));
+            using Process helper = UpdateInstaller.LaunchHelper(payload, installDir, launcher, relaunch: true);
+            launched = true;
+        });
+        if (launched) Application.Current.Shutdown();
+    }
+
+    private void OpenUrl(string url)
+    {
+        try
+        {
+            using Process? process = Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception error) when (error is Win32Exception or InvalidOperationException)
+        {
+            ActivityStatus.Text += $" ({url})";
+        }
     }
 
     private void RefreshIntegrationStatus()
@@ -258,7 +421,7 @@ public partial class MainWindow : Window
             if (useHook && !plan.Hooked)
             {
                 _plan = plan;
-                BuildStatus.Text = "HWP 저장을 사용할 수 없습니다. 실행 파일과 DLL을 다시 확인하세요.";
+                BuildStatus.Text = DescribeBuild(plan);
                 ActivityStatus.Text = "한글을 시작하지 않았습니다.";
                 return;
             }
@@ -284,10 +447,10 @@ public partial class MainWindow : Window
             try
             {
                 RejitStatus status = await RejitLog.WaitAsync(process, log, waitForCompilation: false,
-                    timeout: TimeSpan.FromSeconds(6), cancellationToken: observation.Token);
+                    timeout: TimeSpan.FromSeconds(6), cancellationToken: observation.Token, targetToken: plan.TargetToken);
                 ShowRejitStatus(status, log);
                 continueObserving = status is RejitStatus.RequestAccepted or RejitStatus.NotObserved;
-                if (continueObserving) _ = ObserveCompilation(process, log, observation);
+                if (continueObserving) _ = ObserveCompilation(process, log, observation, plan.TargetToken);
             }
             catch (OperationCanceledException) when (observation.IsCancellationRequested) { }
             finally
@@ -297,16 +460,17 @@ public partial class MainWindow : Window
         });
     }
 
-    private static LaunchPlan CreatePlan(string path, bool forceNormal = false) =>
+    private LaunchPlan CreatePlan(string path, bool forceNormal = false) =>
         SaveHookLauncher.CreatePlan(path, SaveHookLauncher.DefaultProfilerPath, SaveHookLauncher.ProfilerClsid,
-            ClrKind.NetFramework, SaveHookLauncher.DefaultExpectedSha256, forceRunWithoutHook: forceNormal);
+            ClrKind.NetFramework, SaveHookLauncher.DefaultExpectedSha256, forceRunWithoutHook: forceNormal,
+            allowCompatible: _allowCompatible);
 
-    private async Task ObserveCompilation(Process process, string log, CancellationTokenSource observation)
+    private async Task ObserveCompilation(Process process, string log, CancellationTokenSource observation, int targetToken)
     {
         try
         {
             RejitStatus status = await RejitLog.WaitAsync(process, log, waitForCompilation: true, timeout: null,
-                cancellationToken: observation.Token);
+                cancellationToken: observation.Token, targetToken: targetToken);
             if (_observation == observation && !observation.IsCancellationRequested) ShowRejitStatus(status, log);
         }
         catch (OperationCanceledException) when (observation.IsCancellationRequested) { }
@@ -391,5 +555,7 @@ public partial class MainWindow : Window
         BrowseButton.IsEnabled = !_busy;
         ShortcutButton.IsEnabled = !_busy;
         AssocSwitch.IsEnabled = !_busy;
+        CompatSwitch.IsEnabled = !_busy;
+        UpdateButton.IsEnabled = !_busy;
     }
 }
