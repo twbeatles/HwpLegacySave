@@ -100,7 +100,8 @@ public partial class MainWindow : Window
             }
             ActivityStatus.Text = _plan is null
                 ? "찾아보기에서 설치 폴더의 Hwp.exe를 선택하세요."
-                : "실행 중인 한글이 있으면 문서를 저장하고 종료한 뒤 이 창에서 열어 주세요.";
+                : DescribeRunningHangul(await Task.Run(HangulProcesses.GetState))
+                  ?? "실행 중인 한글이 있으면 문서를 저장하고 종료한 뒤 이 창에서 열어 주세요.";
 
             if (_plan is not null && selectedPath is not null)
             {
@@ -110,28 +111,25 @@ public partial class MainWindow : Window
             {
                 SaveHookSettings.WriteSelectedPath(null);
             }
+            // 더블클릭·바로가기 실행이 전체 탐지 없이 바로 쓰도록 자동 선택 결과를 남긴다.
+            if (_plan is not null && !manual) SaveHookSettings.TryWriteDetectedPath(_plan.HwpPath);
         });
     }
 
-    private static string DescribeBuild(LaunchPlan? plan)
+    private static string DescribeBuild(LaunchPlan? plan) => SaveHookLauncher.DescribePlan(plan);
+
+    /// <summary>실행 중인 한글의 HWP 저장 모드 적용 여부 안내. 실행 중인 한글이 없으면 null.</summary>
+    private static string? DescribeRunningHangul(RunningHangulState state) => state switch
     {
-        if (plan is null) return "한글 실행 파일을 찾지 못했습니다.";
-        string label = plan.BuildLabel ?? "알 수 없는 한글 빌드";
-        return plan.Reason switch
-        {
-            "build-hash-match" => $"{label} · 검증된 빌드 · HWP 저장 사용 가능",
-            "compatible-signature" => $"{label} · 검증되지 않은 빌드(실험) · 저장 형식 변환 코드 구조 일치",
-            "compatible-needs-opt-in" => $"{label} · 검증되지 않은 빌드입니다. 구조가 같아 아래 '검증되지 않은 한글 버전에도 시도'를 켜면 적용할 수 있습니다.",
-            "native-build-unsupported" => $"{label} · 이 버전의 Hwp.exe는 .NET 기반이 아니어서 이 방식으로 바꿀 수 없습니다. OFF로 일반 실행하세요.",
-            "target-not-found" => $"{label} · 저장 형식 변환 코드를 찾지 못해 지원하지 않습니다. OFF로 일반 실행하세요.",
-            "target-semantics-differ" => $"{label} · 저장 형식 변환 코드의 동작이 검증 빌드와 달라 적용하지 않습니다. OFF로 일반 실행하세요.",
-            "profiler-missing" => "프로파일러 DLL이 없습니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
-            "build-hash-mismatch" => "다른 한글 빌드입니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
-            "hwp-unreadable" => "한글 실행 파일을 읽을 수 없습니다.",
-            "forced-no-hook" => $"{label} · 일반 실행",
-            _ => label,
-        };
-    }
+        RunningHangulState.AllHooked =>
+            "HWP 저장 모드로 실행 중인 한글이 있습니다. 그 창에서 문서를 열고 저장하면 됩니다.",
+        RunningHangulState.SomeUnhooked =>
+            "HWP 저장 모드 없이 실행된 한글이 있습니다(시작 메뉴·작업 표시줄 등으로 연 경우). " +
+            "그 창에서 저장하면 HWPX로 바뀔 수 있으니 문서를 저장하고 한글을 모두 닫은 뒤 이 창에서 다시 여세요.",
+        RunningHangulState.Unknown =>
+            "실행 중인 한글이 있습니다. 문서를 저장하고 종료한 뒤 이 창에서 열어 주세요.",
+        _ => null,
+    };
 
     private static string FormatVersion(Version version) =>
         version.Build > 0 || version.Revision <= 0 ? version.ToString(3) : version.ToString();
@@ -326,8 +324,18 @@ public partial class MainWindow : Window
     private void RefreshIntegrationStatus()
     {
         string launcherExe = WindowsIntegration.GetCurrentLauncherExecutablePath();
+        bool repaired = false;
+        try
+        {
+            // 연동을 켜 둔 사용자에게서 한컴 업데이트·기본 앱 변경으로 풀린 한글 문서 연결을 다시 감싼다.
+            repaired = WindowsIntegration.RepairFileAssociation(launcherExe);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or InvalidOperationException) { }
+        if (repaired && !_busy) ActivityStatus.Text = "풀려 있던 한글 문서 더블클릭 연동을 다시 연결했습니다.";
+
         _shortcutState = WindowsIntegration.GetShortcutStatus(WindowsIntegration.GetDesktopShortcutPath(), launcherExe);
         _assocState = WindowsIntegration.GetFileAssociationStatus(launcherExe);
+        bool optedIn = WindowsIntegration.IsFileAssociationOptedIn();
 
         ShortcutButton.Content = _shortcutState switch
         {
@@ -345,7 +353,8 @@ public partial class MainWindow : Window
         _isUpdatingUi = true;
         try
         {
-            AssocSwitch.IsChecked = _assocState == IntegrationStatus.Enabled;
+            AssocSwitch.IsChecked = _assocState == IntegrationStatus.Enabled ||
+                                    (_assocState == IntegrationStatus.OtherDefaultApp && optedIn);
         }
         finally
         {
@@ -354,9 +363,12 @@ public partial class MainWindow : Window
 
         AssocStatus.Text = _assocState switch
         {
-            IntegrationStatus.Enabled => "탐색기에서 .hwp 파일을 열 때 자동으로 HWP 저장 모드로 실행됩니다.",
+            IntegrationStatus.Enabled => "탐색기에서 한글 문서(.hwp·.hwpx 등)를 열 때 자동으로 HWP 저장 모드로 실행됩니다.",
             IntegrationStatus.PointsElsewhere => "다른 위치의 런처와 연결되어 있습니다. ON으로 바꾸면 현재 위치로 갱신됩니다.",
-            _ => "탐색기에서 .hwp 파일을 더블클릭할 때 자동으로 적용합니다."
+            IntegrationStatus.OtherDefaultApp =>
+                $"지금 .hwp 기본 앱이 한글이 아닌 '{WindowsIntegration.DescribeDefaultHwpApp() ?? "다른 앱"}'입니다. " +
+                "Windows 설정 > 앱 > 기본 앱에서 .hwp를 한글로 지정해야 더블클릭에 적용됩니다.",
+            _ => "탐색기에서 한글 문서(.hwp·.hwpx 등)를 더블클릭할 때 자동으로 적용합니다."
         };
     }
 
@@ -398,7 +410,7 @@ public partial class MainWindow : Window
             if (enable)
             {
                 WindowsIntegration.EnableFileAssociation(launcherExe);
-                ActivityStatus.Text = "이제 탐색기에서 .hwp 파일을 더블클릭하면 자동으로 HWP 저장 모드가 적용됩니다.";
+                ActivityStatus.Text = "이제 탐색기에서 한글 문서를 더블클릭하면 자동으로 HWP 저장 모드가 적용됩니다.";
             }
             else
             {
@@ -537,7 +549,8 @@ public partial class MainWindow : Window
         try { await action(); }
         catch (HangulAlreadyRunningException)
         {
-            ActivityStatus.Text = "실행 중인 한글을 종료한 뒤 다시 시도하세요.";
+            ActivityStatus.Text = DescribeRunningHangul(await Task.Run(HangulProcesses.GetState))
+                                  ?? "실행 중인 한글을 종료한 뒤 다시 시도하세요.";
         }
         catch (TimeoutException)
         {

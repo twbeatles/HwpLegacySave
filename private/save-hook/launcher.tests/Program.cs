@@ -331,7 +331,6 @@ if (args is ["--cli", string dotnet, string cli])
         ProcessStartInfo? capturedFresh = null;
         TransparentLaunchResult freshResult = SaveHookLauncher.LaunchTransparentCore(
             plan, [@"C:\test\doc.hwp"], Path.Combine(dir, "test.log"),
-            () => false,
             info => { capturedFresh = info; return StartNoopProcess(); },
             mutex);
         try
@@ -352,7 +351,6 @@ if (args is ["--cli", string dotnet, string cli])
         ProcessStartInfo? capturedExisting = null;
         TransparentLaunchResult existingResult = SaveHookLauncher.LaunchTransparentCore(
             plan, [@"C:\test\doc2.hwp"], Path.Combine(dir, "test2.log"),
-            () => true,
             info => { capturedExisting = info; return StartNoopProcess(); },
             mutex);
         try
@@ -363,12 +361,35 @@ if (args is ["--cli", string dotnet, string cli])
         {
             existingResult.Process.Dispose();
         }
-        Check("transparent: existing session opens document without profiler env",
-            !existingResult.AttachedProfiler &&
+        // 한글이 이미 실행 중이어도 프로파일러를 붙인다. 새 프로세스가 기존 창으로 문서를 넘기지 못하고
+        // 독립 인스턴스로 남더라도(동시 더블클릭 등) 훅 없는 한글이 생기지 않아야 한다.
+        Check("transparent: second launch still attaches profiler and forwards args",
+            existingResult.AttachedProfiler &&
             capturedExisting is not null &&
-            !capturedExisting.Environment.ContainsKey("COR_ENABLE_PROFILING") &&
-            !capturedExisting.Environment.ContainsKey("HWP_SAVEHOOK_LOG") &&
+            capturedExisting.Environment.ContainsKey("COR_ENABLE_PROFILING") &&
+            capturedExisting.Environment.ContainsKey("HWP_SAVEHOOK_LOG") &&
             capturedExisting.ArgumentList.SequenceEqual([@"C:\test\doc2.hwp"]));
+
+        LaunchPlan normalPlan = SaveHookLauncher.CreatePlan(fakeHwp, fakeProfiler, SaveHookLauncher.ProfilerClsid,
+            ClrKind.NetFramework, realHash, forceRunWithoutHook: true);
+        ProcessStartInfo? capturedNormal = null;
+        TransparentLaunchResult normalResult = SaveHookLauncher.LaunchTransparentCore(
+            normalPlan, [@"C:\test\doc3.hwp"], Path.Combine(dir, "test3.log"),
+            info => { capturedNormal = info; return StartNoopProcess(); },
+            mutex);
+        try
+        {
+            if (!normalResult.Process.WaitForExit(5000)) normalResult.Process.Kill(entireProcessTree: true);
+        }
+        finally
+        {
+            normalResult.Process.Dispose();
+        }
+        Check("transparent: OFF mode never attaches profiler",
+            !normalResult.AttachedProfiler &&
+            capturedNormal is not null &&
+            !capturedNormal.Environment.ContainsKey("COR_ENABLE_PROFILING") &&
+            !capturedNormal.Environment.ContainsKey("HWP_SAVEHOOK_LOG"));
 
         // Regression check: invoking this test host with unknown args (e.g. --version) must exit immediately, never recurse.
         if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath),
@@ -458,11 +479,130 @@ if (args is ["--cli", string dotnet, string cli])
         }
         Check("assoc: does not treat --open-like substring as wrapper flag",
             WindowsIntegration.ClassifyWrapperCommand($"\"{launcherExe}\" --open-other \"%1\"", launcherExe) == IntegrationStatus.Disabled);
+
+        // 여러 ProgId 되돌리기 정보: 형식 2 왕복과 이전 형식(단일 ProgId) 읽기
+        string backupFile = SaveHookSettings.GetAssociationBackupFilePath(settingsDir);
+        const string hncCommand = @"""C:\Hnc\Hwp.exe"" ""%1""";
+        WindowsIntegration.WriteAssociationBackup(backupFile,
+        [
+            new("Hwp.Document.120", hncCommand, false),
+            new("Hwp.Document.hwpx.120", null, false),
+            new("Hwp.Document.hwt.120", "", true),
+        ]);
+        var roundTrip = WindowsIntegration.ReadAssociationBackup(backupFile);
+        Check("assoc backup: format 2 round-trips every ProgId",
+            roundTrip.Count == 3 &&
+            roundTrip[0] is { ProgId: "Hwp.Document.120", PreviousCommand: hncCommand, CreatedExtensionMapping: false } &&
+            roundTrip[1] is { ProgId: "Hwp.Document.hwpx.120", PreviousCommand: null } &&
+            roundTrip[2] is { PreviousCommand: "", CreatedExtensionMapping: true });
+        const string oldCommand = @"""C:\Old\Hwp.exe"" ""%1""";
+        File.WriteAllText(backupFile, "progId=Hwp.Document.120\r\ncreatedExt=0\r\npreviousCommand=" + oldCommand);
+        var legacy = WindowsIntegration.ReadAssociationBackup(backupFile);
+        Check("assoc backup: reads the single-ProgId format of earlier versions",
+            legacy.Count == 1 && legacy[0] is { ProgId: "Hwp.Document.120", PreviousCommand: oldCommand, CreatedExtensionMapping: false });
+        File.Delete(backupFile);
+
+        // 여러 ProgId를 감싼 뒤 끄면 모두 되돌린다(테스트 레지스트리 루트, ProgId마다 호출).
+        string[] extraProgIds = ["Hwp.Document.hwpx.120", "Hwp.Document.hwt.120"];
+        foreach (string progId in extraProgIds)
+        {
+            WindowsIntegration.EnableFileAssociation(launcherExe, settingsDir, testRegistryRoot, progId, hasExistingSystemMapping: true);
+        }
+        Check("assoc: records one backup entry per wrapped ProgId",
+            WindowsIntegration.ReadAssociationBackup(backupFile).Select(entry => entry.ProgId).SequenceEqual(extraProgIds));
+        Check("assoc: opted-in marker exists while enabled", WindowsIntegration.IsFileAssociationOptedIn(settingsDir));
+        foreach (string progId in extraProgIds)
+        {
+            WindowsIntegration.DisableFileAssociation(settingsDir, testRegistryRoot, progId);
+        }
+        Check("assoc: every wrapped ProgId is cleaned up",
+            extraProgIds.All(progId => Microsoft.Win32.Registry.CurrentUser.OpenSubKey($@"{testRegistryRoot}\{progId}") is null));
+
+        // 다른 앱이 그 사이 명령을 바꿨으면 끌 때 덮어쓰지 않는다.
+        const string foreignCommand = @"""C:\Other\Viewer.exe"" ""%1""";
+        WindowsIntegration.EnableFileAssociation(launcherExe, settingsDir, testRegistryRoot, testProgId, hasExistingSystemMapping: true);
+        using (var foreign = Microsoft.Win32.Registry.CurrentUser.CreateSubKey($@"{testRegistryRoot}\{testProgId}\shell\open\command")!)
+        {
+            foreign.SetValue(null, foreignCommand);
+        }
+        WindowsIntegration.DisableFileAssociation(settingsDir, testRegistryRoot, testProgId);
+        using (var kept = Microsoft.Win32.Registry.CurrentUser.OpenSubKey($@"{testRegistryRoot}\{testProgId}\shell\open\command"))
+        {
+            Check("assoc: leaves a command another app changed meanwhile", kept?.GetValue(null) as string == foreignCommand);
+        }
+
+        // 명령 판별
+        Check("assoc: recognizes Hangul open commands",
+            WindowsIntegration.IsHangulCommand(@"""C:\Program Files (x86)\HNC\Office 2022\HOffice120\bin\Hwp.exe"" ""%1""") &&
+            WindowsIntegration.IsHangulCommand(@"C:\Hnc\Bin\hwp.exe ""%1""") &&
+            !WindowsIntegration.IsHangulCommand(@"C:\Users\me\AppData\Local\HOP\hop-desktop.exe ""%1""") &&
+            !WindowsIntegration.IsHangulCommand(null));
+        Check("assoc: recognizes wrapper commands from any location",
+            WindowsIntegration.IsWrapperCommand(WindowsIntegration.BuildWrapperCommand(otherLauncherExe)) &&
+            !WindowsIntegration.IsWrapperCommand($"\"{launcherExe}\" \"%1\""));
+        Check("assoc: wrapper keeps the original Hangul arguments",
+            WindowsIntegration.BuildWrapperCommand(launcherExe, @"""C:\Hnc\Hwp.exe"" ""%1"" /n") == $"\"{launcherExe}\" --open \"%1\" /n" &&
+            WindowsIntegration.BuildWrapperCommand(launcherExe, @"""C:\Hnc\Hwp.exe"" ""%1""") == WindowsIntegration.BuildWrapperCommand(launcherExe) &&
+            WindowsIntegration.BuildWrapperCommand(launcherExe, @"C:\Hnc\Hwp.exe") == WindowsIntegration.BuildWrapperCommand(launcherExe) &&
+            WindowsIntegration.BuildWrapperCommand(launcherExe, @"""C:\Other\Viewer.exe"" ""%1"" /x") == WindowsIntegration.BuildWrapperCommand(launcherExe));
     }
     finally
     {
         try { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testRegistryRoot, throwOnMissingSubKey: false); } catch { /* best effort */ }
         try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+    }
+}
+
+// --- 장기 운용: 로그 정리, 자동 탐지 경로 캐시, 설정 읽기 재시도, 실행 중 한글 판별 ---
+{
+    string dir = NewTempDir();
+    try
+    {
+        DateTime now = DateTime.UtcNow;
+        for (int i = 0; i < 5; i++)
+        {
+            string file = Path.Combine(dir, $"hwp-{i}.log");
+            File.WriteAllText(file, "log");
+            File.SetLastWriteTimeUtc(file, now.AddMinutes(-i));
+        }
+        string expired = Path.Combine(dir, "hwp-old.log");
+        File.WriteAllText(expired, "log");
+        File.SetLastWriteTimeUtc(expired, now.AddDays(-30));
+        string unrelated = Path.Combine(dir, "keep.txt");
+        File.WriteAllText(unrelated, "keep");
+
+        int deleted = RejitLog.Prune(dir, TimeSpan.FromDays(14), maxFiles: 3, now);
+        Check("logs: prune removes expired and surplus logs only",
+            deleted == 3 && !File.Exists(expired) && File.Exists(unrelated) &&
+            File.Exists(Path.Combine(dir, "hwp-0.log")) && File.Exists(Path.Combine(dir, "hwp-2.log")) &&
+            !File.Exists(Path.Combine(dir, "hwp-3.log")));
+
+        string settingsDir = Path.Combine(dir, "settings");
+        Check("detected path: empty by default", SaveHookSettings.ReadDetectedPathRaw(settingsDir) is null);
+        SaveHookSettings.TryWriteDetectedPath(@"C:\Hnc\Hwp.exe", settingsDir);
+        Check("detected path: round-trips and stays separate from manual selection",
+            SaveHookSettings.ReadDetectedPathRaw(settingsDir) == @"C:\Hnc\Hwp.exe" &&
+            SaveHookSettings.ReadSelectedPathRaw(settingsDir) is null);
+        SaveHookSettings.TryWriteDetectedPath(null, settingsDir);
+        Check("detected path: cleared", SaveHookSettings.ReadDetectedPathRaw(settingsDir) is null);
+
+        // 다른 창이 설정을 쓰는 중(공유 위반)에도 OFF로 잘못 읽지 않는다.
+        SaveHookSettings.WriteHookEnabled(true, settingsDir);
+        var locked = new FileStream(SaveHookSettings.GetModeFilePath(settingsDir), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        _ = Task.Run(async () => { await Task.Delay(60); locked.Dispose(); });
+        Check("settings: retries while another writer holds the file", SaveHookSettings.ReadHookEnabled(settingsDir));
+    }
+    finally
+    {
+        try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+    }
+
+    int self = Environment.ProcessId;
+    Check("processes: module probe finds a loaded module", HangulProcesses.HasModule(self, "kernel32.dll") == true);
+    Check("processes: module probe reports a missing module", HangulProcesses.HasModule(self, "HwpSaveHookProfiler.dll") == false);
+    if (Process.GetProcessesByName("Hwp").Length == 0)
+    {
+        Check("processes: no running Hangul -> None", HangulProcesses.GetState() == RunningHangulState.None);
     }
 }
 

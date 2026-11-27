@@ -28,7 +28,7 @@ public static class SaveHookSettings
         string modeFile = GetModeFilePath(settingsDirectory);
         try
         {
-            return string.Equals(File.ReadAllText(modeFile).Trim(), "on", StringComparison.Ordinal);
+            return string.Equals(ReadSettingText(modeFile).Trim(), "on", StringComparison.Ordinal);
         }
         catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
         {
@@ -37,6 +37,25 @@ public static class SaveHookSettings
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// 설정 파일을 읽는다. 다른 런처 창이 같은 파일을 원자적으로 교체하는 순간에는 공유 위반이 날 수 있어
+    /// 잠시 기다렸다 다시 읽는다. 공유 위반 때문에 HWP 저장 모드가 꺼진 것으로 잘못 판정되지 않게 한다.
+    /// </summary>
+    internal static string ReadSettingText(string path)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return File.ReadAllText(path);
+            }
+            catch (IOException error) when (attempt < 4 && error is not FileNotFoundException and not DirectoryNotFoundException)
+            {
+                System.Threading.Thread.Sleep(40 * (attempt + 1));
+            }
         }
     }
 
@@ -54,7 +73,7 @@ public static class SaveHookSettings
     {
         try
         {
-            return string.Equals(File.ReadAllText(GetCompatibleModeFilePath(settingsDirectory)).Trim(), "on", StringComparison.Ordinal);
+            return string.Equals(ReadSettingText(GetCompatibleModeFilePath(settingsDirectory)).Trim(), "on", StringComparison.Ordinal);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
         {
@@ -65,12 +84,41 @@ public static class SaveHookSettings
     public static void WriteCompatibleEnabled(bool enabled, string? settingsDirectory = null) =>
         WriteSettingAtomic(GetCompatibleModeFilePath(settingsDirectory), enabled ? "on" : "off", settingsDirectory);
 
-    public static string? ReadSelectedPathRaw(string? settingsDirectory = null)
+    public static string? ReadSelectedPathRaw(string? settingsDirectory = null) =>
+        ReadPathFile(GetSelectedPathFilePath(settingsDirectory));
+
+    /// <summary>
+    /// 마지막으로 자동 탐지한 Hwp.exe 경로. 직접 지정(hwp-path.txt)과 구분한다.
+    /// 더블클릭·바로가기 실행이 매번 전체 탐지를 하다가 느린 드라이브 때문에 시간 초과되는 일을 막는다.
+    /// </summary>
+    public static string GetDetectedPathFilePath(string? settingsDirectory = null) =>
+        Path.Combine(settingsDirectory ?? DefaultSettingsDirectory, "hwp-path-detected.txt");
+
+    public static string? ReadDetectedPathRaw(string? settingsDirectory = null) =>
+        ReadPathFile(GetDetectedPathFilePath(settingsDirectory));
+
+    /// <summary>자동 탐지 결과를 기록한다. 실패해도 실행에는 영향이 없다.</summary>
+    public static void TryWriteDetectedPath(string? hwpPath, string? settingsDirectory = null)
     {
-        string selectedPathFile = GetSelectedPathFilePath(settingsDirectory);
         try
         {
-            string stored = File.ReadAllText(selectedPathFile).Trim();
+            string file = GetDetectedPathFilePath(settingsDirectory);
+            if (string.IsNullOrWhiteSpace(hwpPath))
+            {
+                if (File.Exists(file)) File.Delete(file);
+                return;
+            }
+            if (string.Equals(ReadPathFile(file), hwpPath, StringComparison.OrdinalIgnoreCase)) return;
+            WriteSettingAtomic(file, hwpPath!, settingsDirectory);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or ArgumentException) { }
+    }
+
+    private static string? ReadPathFile(string file)
+    {
+        try
+        {
+            string stored = ReadSettingText(file).Trim();
             return string.IsNullOrWhiteSpace(stored) ? null : stored;
         }
         catch (Exception error) when (error is IOException or ArgumentException or UnauthorizedAccessException or SecurityException)

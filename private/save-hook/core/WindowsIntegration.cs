@@ -20,12 +20,14 @@ public enum IntegrationStatus
     Disabled,
     Enabled,
     PointsElsewhere,
+    /// <summary>.hwp 기본 앱이 한글이 아닌 다른 앱(HOP, 이음오피스 등)이다. 더블클릭이 한글로 가지 않는다.</summary>
+    OtherDefaultApp,
 }
 
 public sealed record ShortcutInfo(string TargetPath, string Arguments, string IconLocation);
 
 /// <summary>
-/// 관리자 권한 없이 현재 사용자(HKCU) 수준에서 바탕화면 바로가기 및 .hwp 파일 연결을 관리한다.
+/// 관리자 권한 없이 현재 사용자(HKCU) 수준에서 바탕화면 바로가기 및 한글 문서 파일 연결을 관리한다.
 /// </summary>
 #if !NETFRAMEWORK
 [SupportedOSPlatform("windows")]
@@ -36,6 +38,17 @@ public static class WindowsIntegration
     private const string DefaultClassesPrefix = @"Software\Classes";
     private const string DefaultFallbackProgId = "Hwp.Document.120";
     private const string WrapperFlag = "--open";
+    private const string LauncherExecutableName = "HwpSaveHook.exe";
+    private const string HangulExecutableName = "Hwp.exe";
+    private const string FileExtsKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts";
+
+    /// <summary>
+    /// 한글이 여는 문서 형식. .hwp만 감싸면 .hwpx·서식 파일로 먼저 연 한글이 훅 없이 실행되고,
+    /// 그 뒤에 더블클릭한 .hwp도 그 창으로 전달돼 HWPX로 저장된다. 그래서 한글 문서 형식 전체를 감싼다.
+    /// 프로파일러는 .hwp 경로를 HWPX로 바꾸는 메서드에만 작용하므로 다른 형식의 저장 결과는 그대로다.
+    /// </summary>
+    public static IReadOnlyList<string> HangulDocumentExtensions { get; } =
+        [".hwp", ".hwpx", ".hwt", ".hwtx", ".hml", ".owpml"];
 
     public static string GetCurrentLauncherExecutablePath()
     {
@@ -54,7 +67,7 @@ public static class WindowsIntegration
             return Path.GetFullPath(modulePath!);
         }
 
-        return Path.Combine(AppContext.BaseDirectory, "HwpSaveHook.exe");
+        return Path.Combine(AppContext.BaseDirectory, LauncherExecutableName);
     }
 
     public static string GetDesktopShortcutPath() =>
@@ -148,22 +161,27 @@ public static class WindowsIntegration
         }
     }
 
-    public static (string ProgId, bool HasExistingMapping) ResolveHwpProgId()
+    public static (string ProgId, bool HasExistingMapping) ResolveHwpProgId() => ResolveProgId(".hwp");
+
+    /// <summary>탐색기가 실제로 쓰는 확장자의 ProgId. Windows 11의 UserChoiceLatest가 UserChoice보다 우선한다.</summary>
+    internal static (string ProgId, bool HasExistingMapping) ResolveProgId(string extension)
     {
-        try
+        foreach (string userChoice in new[] { $@"{FileExtsKey}\{extension}\UserChoiceLatest\ProgId", $@"{FileExtsKey}\{extension}\UserChoice" })
         {
-            using RegistryKey? userChoice = Registry.CurrentUser.OpenSubKey(
-                @"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.hwp\UserChoice");
-            if (userChoice?.GetValue("Progid") is string userProgId && !string.IsNullOrWhiteSpace(userProgId))
+            try
             {
-                return (userProgId.Trim(), true);
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(userChoice);
+                if (key?.GetValue("ProgId") is string userProgId && !string.IsNullOrWhiteSpace(userProgId))
+                {
+                    return (userProgId.Trim(), true);
+                }
             }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException) { }
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException) { }
 
         try
         {
-            using RegistryKey? extKey = Registry.ClassesRoot.OpenSubKey(".hwp");
+            using RegistryKey? extKey = Registry.ClassesRoot.OpenSubKey(extension);
             if (extKey?.GetValue(null) is string rootProgId && !string.IsNullOrWhiteSpace(rootProgId))
             {
                 return (rootProgId.Trim(), true);
@@ -174,32 +192,198 @@ public static class WindowsIntegration
         return (DefaultFallbackProgId, false);
     }
 
+    /// <summary>확장자에 연결될 수 있는 ProgId 후보(사용자 선택, 시스템 기본, [연결 프로그램] 목록).</summary>
+    private static List<string> CandidateProgIds(string extension)
+    {
+        var candidates = new List<string>();
+        (string resolved, bool mapped) = ResolveProgId(extension);
+        if (mapped) candidates.Add(resolved);
+
+        try
+        {
+            using RegistryKey? extKey = Registry.ClassesRoot.OpenSubKey(extension);
+            if (extKey?.GetValue(null) is string rootProgId && !string.IsNullOrWhiteSpace(rootProgId)) candidates.Add(rootProgId.Trim());
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException) { }
+
+        foreach ((RegistryKey hive, string listKey) in new[]
+                 {
+                     (Registry.CurrentUser, $@"{FileExtsKey}\{extension}\OpenWithProgids"),
+                     (Registry.ClassesRoot, $@"{extension}\OpenWithProgids"),
+                 })
+        {
+            try
+            {
+                using RegistryKey? key = hive.OpenSubKey(listKey);
+                foreach (string name in key?.GetValueNames() ?? [])
+                {
+                    if (!string.IsNullOrWhiteSpace(name)) candidates.Add(name.Trim());
+                }
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException) { }
+        }
+        return candidates;
+    }
+
+    /// <summary>
+    /// 한글(Hwp.exe)로 문서를 여는 ProgId 전체. 다른 앱(HOP, 이음오피스 등)의 ProgId는 건드리지 않는다.
+    /// 이미 런처로 감싼 ProgId도 포함한다.
+    /// </summary>
+    public static IReadOnlyList<string> FindHangulProgIds()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (string extension in HangulDocumentExtensions)
+        {
+            foreach (string progId in CandidateProgIds(extension))
+            {
+                if (seen.Add(progId) && IsHangulProgId(progId)) result.Add(progId);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>ProgId의 열기 명령이 Hwp.exe를 실행하거나 이미 런처로 감싸져 있는지.</summary>
+    internal static bool IsHangulProgId(string progId, string classesPrefix = DefaultClassesPrefix)
+    {
+        if (string.Equals(progId, $@"Applications\{HangulExecutableName}", StringComparison.OrdinalIgnoreCase)) return true;
+
+        string? userCommand = ReadUserKeyDefault($@"{classesPrefix}\{progId}\shell\open\command");
+        if (userCommand is not null && (IsWrapperCommand(userCommand) || IsHangulCommand(userCommand))) return true;
+        return IsHangulCommand(ReadMachineCommand(progId));
+    }
+
+    internal static bool IsHangulCommand(string? command)
+    {
+        string? executable = CommandExecutable(command);
+        return executable is not null &&
+               string.Equals(Path.GetFileName(executable), HangulExecutableName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>위치와 관계없이 이 런처의 투명 실행 명령인지.</summary>
+    internal static bool IsWrapperCommand(string command)
+    {
+        string? executable = CommandExecutable(command);
+        return executable is not null &&
+               string.Equals(Path.GetFileName(executable), LauncherExecutableName, StringComparison.OrdinalIgnoreCase) &&
+               command.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+                   .Any(token => string.Equals(token, WrapperFlag, StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static string? CommandExecutable(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return null;
+        string trimmed = Environment.ExpandEnvironmentVariables(command!).Trim();
+        if (trimmed.StartsWith("\"", StringComparison.Ordinal))
+        {
+            int closing = trimmed.IndexOf('"', 1);
+            return closing > 1 ? trimmed.Substring(1, closing - 1) : null;
+        }
+        int exe = trimmed.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+        if (exe > 0) return trimmed.Substring(0, exe + 4);
+        int space = trimmed.IndexOf(' ');
+        return space > 0 ? trimmed.Substring(0, space) : trimmed;
+    }
+
+    /// <summary>시스템(HKLM)에 등록된 원래 열기 명령.</summary>
+    private static string? ReadMachineCommand(string progId)
+    {
+        foreach (RegistryView view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+        {
+            try
+            {
+                using RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                using RegistryKey? key = root.OpenSubKey($@"Software\Classes\{progId}\shell\open\command");
+                if (key?.GetValue(null) is string command && !string.IsNullOrWhiteSpace(command)) return command;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException or ArgumentException) { }
+        }
+        return null;
+    }
+
     public static string BuildWrapperCommand(string launcherExePath) =>
         $"\"{Path.GetFullPath(launcherExePath)}\" {WrapperFlag} \"%1\"";
 
+    /// <summary>
+    /// 원래 한글 열기 명령의 인자를 유지한 래퍼 명령. 한글 버전에 따라 "%1" 뒤에 옵션이 붙을 수 있어
+    /// 실행 파일 부분만 런처로 바꾸고 나머지는 그대로 Hwp.exe에 넘긴다.
+    /// </summary>
+    internal static string BuildWrapperCommand(string launcherExePath, string? originalCommand)
+    {
+        if (!IsHangulCommand(originalCommand)) return BuildWrapperCommand(launcherExePath);
+        string trimmed = originalCommand!.Trim();
+        string rest = trimmed.StartsWith("\"", StringComparison.Ordinal)
+            ? trimmed.Substring(trimmed.IndexOf('"', 1) + 1)
+            : trimmed.Substring(trimmed.IndexOf(".exe", StringComparison.OrdinalIgnoreCase) + 4);
+        rest = rest.Trim();
+        if (rest.IndexOf("%1", StringComparison.Ordinal) < 0 && rest.IndexOf("%L", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            rest = (rest + " \"%1\"").Trim();
+        }
+        return $"\"{Path.GetFullPath(launcherExePath)}\" {WrapperFlag} {rest}";
+    }
+
+    /// <summary>
+    /// .hwp 더블클릭 연동 상태. 기본 앱이 한글이 아닌 다른 앱이면 <see cref="IntegrationStatus.OtherDefaultApp"/>.
+    /// </summary>
     public static IntegrationStatus GetFileAssociationStatus(
         string launcherExePath,
         string? classesSubKeyPrefix = null,
         string? customProgId = null)
     {
         string prefix = classesSubKeyPrefix ?? DefaultClassesPrefix;
-        string progId = customProgId ?? ResolveHwpProgId().ProgId;
-        string commandKeyPath = $@"{prefix}\{progId}\shell\open\command";
+        (string resolvedProgId, bool mapped) = customProgId is null ? ResolveHwpProgId() : (customProgId, true);
+        string progId = customProgId ?? resolvedProgId;
 
-        try
+        string? command = ReadUserKeyDefault($@"{prefix}\{progId}\shell\open\command");
+        if (!string.IsNullOrWhiteSpace(command))
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(commandKeyPath);
-            if (key?.GetValue(null) is not string command || string.IsNullOrWhiteSpace(command))
-            {
-                return IntegrationStatus.Disabled;
-            }
+            IntegrationStatus status = ClassifyWrapperCommand(command!, launcherExePath);
+            if (status != IntegrationStatus.Disabled) return status;
+        }
 
-            return ClassifyWrapperCommand(command, launcherExePath);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
+        if (customProgId is null && classesSubKeyPrefix is null && mapped && !IsHangulProgId(progId))
         {
-            return IntegrationStatus.Disabled;
+            return IntegrationStatus.OtherDefaultApp;
         }
+        return IntegrationStatus.Disabled;
+    }
+
+    /// <summary>현재 .hwp 기본 앱의 실행 파일 이름(안내 문구용). 알 수 없으면 null.</summary>
+    public static string? DescribeDefaultHwpApp()
+    {
+        (string progId, bool mapped) = ResolveHwpProgId();
+        if (!mapped) return null;
+        string? command = ReadUserKeyDefault($@"{DefaultClassesPrefix}\{progId}\shell\open\command") ?? ReadMachineCommand(progId);
+        string? executable = CommandExecutable(command);
+        return executable is null ? progId : Path.GetFileName(executable);
+    }
+
+    /// <summary>사용자가 더블클릭 연동을 켠 적이 있는지(되돌리기 정보가 남아 있는지).</summary>
+    public static bool IsFileAssociationOptedIn(string? settingsDirectory = null) =>
+        File.Exists(SaveHookSettings.GetAssociationBackupFilePath(settingsDirectory));
+
+    /// <summary>
+    /// 연동을 켠 뒤 한컴 업데이트·기본 앱 변경으로 감싸지지 않은 한글 ProgId가 생겼는지.
+    /// 다른 위치의 런처를 가리키는 연동은 사용자가 고를 일이므로 복구 대상에서 뺀다.
+    /// </summary>
+    public static bool NeedsAssociationRepair(string launcherExePath, string? settingsDirectory = null)
+    {
+        if (!IsFileAssociationOptedIn(settingsDirectory)) return false;
+        if (GetFileAssociationStatus(launcherExePath) == IntegrationStatus.PointsElsewhere) return false;
+        return FindHangulProgIds().Any(progId =>
+        {
+            string? command = ReadUserKeyDefault($@"{DefaultClassesPrefix}\{progId}\shell\open\command");
+            return command is null || ClassifyWrapperCommand(command, launcherExePath) == IntegrationStatus.Disabled;
+        });
+    }
+
+    /// <summary>연동을 켜 둔 사용자에게서 풀린 연결을 다시 감싼다. 바꾼 것이 있으면 true.</summary>
+    public static bool RepairFileAssociation(string launcherExePath, string? settingsDirectory = null)
+    {
+        if (!NeedsAssociationRepair(launcherExePath, settingsDirectory)) return false;
+        EnableFileAssociation(launcherExePath, settingsDirectory);
+        return true;
     }
 
     public static void EnableFileAssociation(
@@ -211,38 +395,73 @@ public static class WindowsIntegration
     {
         string prefix = classesSubKeyPrefix ?? DefaultClassesPrefix;
         (string resolvedProgId, bool existingMapping) = ResolveHwpProgId();
-        string progId = customProgId ?? resolvedProgId;
         bool hasMapping = hasExistingSystemMapping ?? existingMapping;
 
-        string commandKeyPath = $@"{prefix}\{progId}\shell\open\command";
-        string? currentCommand = ReadUserKeyDefault(commandKeyPath);
-        bool alreadyWrapped = currentCommand is not null &&
-                              ClassifyWrapperCommand(currentCommand, launcherExePath) != IntegrationStatus.Disabled;
+        var progIds = new List<string>();
+        if (customProgId is not null)
+        {
+            progIds.Add(customProgId);
+        }
+        else
+        {
+            progIds.AddRange(FindHangulProgIds());
+            if (progIds.Count == 0)
+            {
+                if (hasMapping)
+                {
+                    throw new InvalidOperationException(
+                        $".hwp 문서가 한글이 아닌 다른 앱({DescribeDefaultHwpApp() ?? resolvedProgId})에 연결돼 있고 한글 문서 연결을 찾지 못했습니다. " +
+                        "Windows 설정 > 기본 앱에서 .hwp를 한글로 지정한 뒤 다시 켜 주세요.");
+                }
+                progIds.Add(resolvedProgId);
+            }
+        }
 
         string backupFile = SaveHookSettings.GetAssociationBackupFilePath(settingsDirectory);
-        if (!alreadyWrapped)
+        List<AssociationBackup> backup = ReadAssociationBackup(backupFile);
+        bool backupWritten = File.Exists(backupFile);
+        bool extensionHandled = hasMapping;
+
+        foreach (string progId in progIds)
         {
-            bool createdExt = false;
-            if (!hasMapping)
+            string commandKeyPath = $@"{prefix}\{progId}\shell\open\command";
+            string? currentCommand = ReadUserKeyDefault(commandKeyPath);
+            bool alreadyWrapped = currentCommand is not null && IsWrapperCommand(currentCommand);
+
+            if (!alreadyWrapped && !backup.Any(entry => string.Equals(entry.ProgId, progId, StringComparison.OrdinalIgnoreCase)))
             {
-                string extKeyPath = $@"{prefix}\.hwp";
-                if (string.IsNullOrWhiteSpace(ReadUserKeyDefault(extKeyPath)))
+                bool createdExt = false;
+                // .hwp 연결이 아예 없는 PC에서만 첫 ProgId로 사용자 연결을 만든다.
+                if (!extensionHandled)
                 {
-                    using RegistryKey extKey = Registry.CurrentUser.CreateSubKey(extKeyPath)
-                        ?? throw new InvalidOperationException(".hwp 확장자 레지스트리 키를 만들 수 없습니다.");
-                    extKey.SetValue(null, progId, RegistryValueKind.String);
-                    createdExt = true;
+                    extensionHandled = true;
+                    string extKeyPath = $@"{prefix}\.hwp";
+                    if (string.IsNullOrWhiteSpace(ReadUserKeyDefault(extKeyPath)))
+                    {
+                        using RegistryKey extKey = Registry.CurrentUser.CreateSubKey(extKeyPath)
+                            ?? throw new InvalidOperationException(".hwp 확장자 레지스트리 키를 만들 수 없습니다.");
+                        extKey.SetValue(null, progId, RegistryValueKind.String);
+                        createdExt = true;
+                    }
                 }
+                backup.Add(new AssociationBackup(progId, currentCommand, createdExt));
+                // 되돌리기 정보를 먼저 남긴 뒤 명령을 바꾼다. 중간에 실패해도 원래 명령을 잃지 않는다.
+                WriteAssociationBackup(backupFile, backup);
+                backupWritten = true;
             }
 
-            WriteAssociationBackup(backupFile, progId, currentCommand, createdExt);
+            string? originalCommand = alreadyWrapped
+                ? backup.FirstOrDefault(entry => string.Equals(entry.ProgId, progId, StringComparison.OrdinalIgnoreCase))?.PreviousCommand
+                : currentCommand;
+            if (!IsHangulCommand(originalCommand) && customProgId is null) originalCommand = ReadMachineCommand(progId);
+
+            using RegistryKey cmdKey = Registry.CurrentUser.CreateSubKey(commandKeyPath)
+                ?? throw new InvalidOperationException("파일 연결 레지스트리 키를 만들 수 없습니다.");
+            cmdKey.SetValue(null, BuildWrapperCommand(launcherExePath, originalCommand), RegistryValueKind.String);
         }
 
-        using (RegistryKey cmdKey = Registry.CurrentUser.CreateSubKey(commandKeyPath)
-            ?? throw new InvalidOperationException("파일 연결 레지스트리 키를 만들 수 없습니다."))
-        {
-            cmdKey.SetValue(null, BuildWrapperCommand(launcherExePath), RegistryValueKind.String);
-        }
+        // 연동을 켰다는 표식(되돌리기 정보)은 항상 남긴다. 자동 복구가 이 파일로 사용자 선택을 판단한다.
+        if (!backupWritten) WriteAssociationBackup(backupFile, backup);
 
         if (classesSubKeyPrefix is null)
         {
@@ -257,24 +476,49 @@ public static class WindowsIntegration
     {
         string prefix = classesSubKeyPrefix ?? DefaultClassesPrefix;
         string backupFile = SaveHookSettings.GetAssociationBackupFilePath(settingsDirectory);
-        AssociationBackup? backup = ReadAssociationBackup(backupFile);
-        string progId = customProgId ?? backup?.ProgId ?? ResolveHwpProgId().ProgId;
-        string commandKeyPath = $@"{prefix}\{progId}\shell\open\command";
+        List<AssociationBackup> backup = ReadAssociationBackup(backupFile);
 
-        if (backup?.PreviousCommand is string previous)
+        var targets = new List<AssociationBackup>();
+        if (customProgId is not null)
         {
-            using RegistryKey cmdKey = Registry.CurrentUser.CreateSubKey(commandKeyPath)
-                ?? throw new InvalidOperationException("기존 파일 연결 레지스트리 키를 복원할 수 없습니다.");
-            cmdKey.SetValue(null, previous, RegistryValueKind.String);
+            targets.Add(backup.FirstOrDefault(entry => string.Equals(entry.ProgId, customProgId, StringComparison.OrdinalIgnoreCase))
+                        ?? new AssociationBackup(customProgId, null, false));
         }
         else
         {
-            DeleteKeyAndEmptyParents(prefix, progId);
+            targets.AddRange(backup);
+            // 되돌리기 정보에 없지만 런처로 감싸진 한글 ProgId(이전 버전·정보 유실)도 정리한다.
+            foreach (string progId in FindHangulProgIds())
+            {
+                if (targets.Any(entry => string.Equals(entry.ProgId, progId, StringComparison.OrdinalIgnoreCase))) continue;
+                string? command = ReadUserKeyDefault($@"{prefix}\{progId}\shell\open\command");
+                if (command is not null && IsWrapperCommand(command)) targets.Add(new AssociationBackup(progId, null, false));
+            }
+            if (targets.Count == 0) targets.Add(new AssociationBackup(ResolveHwpProgId().ProgId, null, false));
         }
 
-        if (backup?.CreatedExtensionMapping == true)
+        foreach (AssociationBackup entry in targets)
         {
-            TryDeleteDefaultAndEmptyKey($@"{prefix}\.hwp");
+            string commandKeyPath = $@"{prefix}\{entry.ProgId}\shell\open\command";
+            string? current = ReadUserKeyDefault(commandKeyPath);
+            // 그 사이 다른 앱이 명령을 바꿨다면 그대로 둔다.
+            if (current is not null && !IsWrapperCommand(current)) continue;
+
+            if (entry.PreviousCommand is string previous)
+            {
+                using RegistryKey cmdKey = Registry.CurrentUser.CreateSubKey(commandKeyPath)
+                    ?? throw new InvalidOperationException("기존 파일 연결 레지스트리 키를 복원할 수 없습니다.");
+                cmdKey.SetValue(null, previous, RegistryValueKind.String);
+            }
+            else
+            {
+                DeleteKeyAndEmptyParents(prefix, entry.ProgId);
+            }
+
+            if (entry.CreatedExtensionMapping)
+            {
+                TryDeleteDefaultAndEmptyKey($@"{prefix}\.hwp");
+            }
         }
 
         if (File.Exists(backupFile))
@@ -405,33 +649,56 @@ public static class WindowsIntegration
         return key.SubKeyCount == 0 && key.ValueCount == 0;
     }
 
-    private sealed record AssociationBackup(string ProgId, string? PreviousCommand, bool CreatedExtensionMapping);
+    internal sealed record AssociationBackup(string ProgId, string? PreviousCommand, bool CreatedExtensionMapping);
 
-    private static void WriteAssociationBackup(string backupFile, string progId, string? previousCommand, bool createdExt)
+    // 형식 2: ProgId마다 "entry=ProgId<TAB>createdExt<TAB>hasPrevious<TAB>previousCommand" 한 줄.
+    // 형식 1(이전 버전): progId=, createdExt=, previousCommand= 각 한 줄. 읽기만 지원한다.
+    private const string BackupFormatLine = "format=2";
+
+    internal static void WriteAssociationBackup(string backupFile, IReadOnlyList<AssociationBackup> entries)
     {
-        var lines = new List<string>
+        var lines = new List<string> { BackupFormatLine };
+        foreach (AssociationBackup entry in entries)
         {
-            $"progId={progId}",
-            $"createdExt={(createdExt ? "1" : "0")}",
-        };
-        if (previousCommand is not null)
-        {
-            lines.Add($"previousCommand={previousCommand}");
+            lines.Add(string.Join("\t",
+                "entry=" + entry.ProgId,
+                entry.CreatedExtensionMapping ? "1" : "0",
+                entry.PreviousCommand is null ? "0" : "1",
+                entry.PreviousCommand ?? ""));
         }
         SaveHookSettings.WriteSettingAtomic(backupFile, string.Join(Environment.NewLine, lines),
             Path.GetDirectoryName(backupFile));
     }
 
-    private static AssociationBackup? ReadAssociationBackup(string backupFile)
+    internal static List<AssociationBackup> ReadAssociationBackup(string backupFile)
     {
-        if (!File.Exists(backupFile)) return null;
+        var entries = new List<AssociationBackup>();
+        if (!File.Exists(backupFile)) return entries;
         try
         {
+            string[] lines = SaveHookSettings.ReadSettingText(backupFile)
+                .Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries);
+
+            if (lines.Any(line => line.Trim() == BackupFormatLine))
+            {
+                foreach (string line in lines)
+                {
+                    if (!line.StartsWith("entry=", StringComparison.Ordinal)) continue;
+                    string[] parts = line.Substring("entry=".Length).Split(['\t'], 4);
+                    if (parts.Length < 3 || string.IsNullOrWhiteSpace(parts[0])) continue;
+                    string? previous = parts[2] == "1" ? (parts.Length == 4 ? parts[3] : "") : null;
+                    if (!entries.Any(entry => string.Equals(entry.ProgId, parts[0], StringComparison.OrdinalIgnoreCase)))
+                    {
+                        entries.Add(new AssociationBackup(parts[0], previous, parts[1] == "1"));
+                    }
+                }
+                return entries;
+            }
+
             string? progId = null;
             string? previousCommand = null;
             bool createdExt = false;
-
-            foreach (string line in File.ReadAllLines(backupFile))
+            foreach (string line in lines)
             {
                 int sep = line.IndexOf('=');
                 if (sep <= 0) continue;
@@ -450,15 +717,10 @@ public static class WindowsIntegration
                         break;
                 }
             }
-
-            return string.IsNullOrWhiteSpace(progId)
-                ? null
-                : new AssociationBackup(progId!, previousCommand, createdExt);
+            if (!string.IsNullOrWhiteSpace(progId)) entries.Add(new AssociationBackup(progId!, previousCommand, createdExt));
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
-        {
-            return null;
-        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException) { }
+        return entries;
     }
 
     private static void NotifyShellAssociationChanged()

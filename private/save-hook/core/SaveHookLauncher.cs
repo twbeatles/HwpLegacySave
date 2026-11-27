@@ -297,6 +297,27 @@ public static class SaveHookLauncher
         return new(HookDecision.RunWithoutHook, "compatible-needs-opt-in", actual);
     }
 
+    /// <summary>실행 계획의 빌드·적용 가능 여부를 사람이 읽는 문장으로 바꾼다. GUI와 투명 실행이 함께 쓴다.</summary>
+    public static string DescribePlan(LaunchPlan? plan)
+    {
+        if (plan is null) return "한글 실행 파일을 찾지 못했습니다.";
+        string label = plan.BuildLabel ?? "알 수 없는 한글 빌드";
+        return plan.Reason switch
+        {
+            "build-hash-match" => $"{label} · 검증된 빌드 · HWP 저장 사용 가능",
+            "compatible-signature" => $"{label} · 검증되지 않은 빌드(실험) · 저장 형식 변환 코드 구조 일치",
+            "compatible-needs-opt-in" => $"{label} · 검증되지 않은 빌드입니다. 구조가 같아 아래 '검증되지 않은 한글 버전에도 시도'를 켜면 적용할 수 있습니다.",
+            "native-build-unsupported" => $"{label} · 이 버전의 Hwp.exe는 .NET 기반이 아니어서 이 방식으로 바꿀 수 없습니다. OFF로 일반 실행하세요.",
+            "target-not-found" => $"{label} · 저장 형식 변환 코드를 찾지 못해 지원하지 않습니다. OFF로 일반 실행하세요.",
+            "target-semantics-differ" => $"{label} · 저장 형식 변환 코드의 동작이 검증 빌드와 달라 적용하지 않습니다. OFF로 일반 실행하세요.",
+            "profiler-missing" => "프로파일러 DLL이 없습니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
+            "build-hash-mismatch" => "다른 한글 빌드입니다. OFF로 바꾸면 일반 실행할 수 있습니다.",
+            "hwp-unreadable" => "한글 실행 파일을 읽을 수 없습니다.",
+            "forced-no-hook" => $"{label} · 일반 실행",
+            _ => label,
+        };
+    }
+
     /// <summary>
     /// 계획대로 자식 Hwp.exe를 띄운다. 후킹 환경변수는 자식에게만 설정되고 상속된다.
     /// 이미 열려 있던 한글에는 영향 없다(설계 §6-4). 디스크·서명 무변경.
@@ -309,19 +330,20 @@ public static class SaveHookLauncher
     }
 
     /// <summary>
-    /// 투명 래퍼(--open)용 실행. 한글이 실행 중이 아니면 계획대로 프로파일러를 연결해 시작하고,
-    /// 이미 실행 중이면 기존 창에서 문서를 열 수 있도록 프로파일러 환경변수 없이 인자만 전달한다.
+    /// 투명 래퍼(--open)용 실행. 후킹 계획이면 한글 실행 여부와 관계없이 프로파일러를 연결한다.
+    /// 한글이 이미 실행 중이면 새 프로세스는 문서를 기존 창으로 넘기고 바로 끝난다(약 0.3초 추가).
+    /// 기존 창이 아직 준비되지 않아 새 프로세스가 독립 인스턴스로 남거나(동시 더블클릭 등),
+    /// 뮤텍스 대기가 시간 초과된 경우에도 훅 없는 한글이 생기지 않게 한다.
     /// </summary>
     public static TransparentLaunchResult LaunchTransparent(
         LaunchPlan plan, IEnumerable<string>? hwpArguments = null, string? profilerLog = null) =>
-        LaunchTransparentCore(plan, hwpArguments, profilerLog, IsHangulRunningInSession,
+        LaunchTransparentCore(plan, hwpArguments, profilerLog,
             startInfo => Process.Start(startInfo) ?? throw new InvalidOperationException($"Failed to start {plan.HwpPath}."));
 
     internal static TransparentLaunchResult LaunchTransparentCore(
         LaunchPlan plan,
         IEnumerable<string>? hwpArguments,
         string? profilerLog,
-        Func<bool> isRunning,
         Func<ProcessStartInfo, Process> startProcess,
         string mutexName = @"Local\HwpSaveHook.Launch")
     {
@@ -332,8 +354,8 @@ public static class SaveHookLauncher
 
         try
         {
-            bool running = !ownsMutex || isRunning();
-            bool attachProfiler = !running && plan.Hooked;
+            // 동시에 열린 문서들이 차례로 한글에 전달되도록 뮤텍스로 직렬화만 한다.
+            bool attachProfiler = plan.Hooked;
             ProcessStartInfo startInfo = CreateStartInfo(plan, attachProfiler, hwpArguments, profilerLog);
             return new TransparentLaunchResult(startProcess(startInfo), attachProfiler);
         }
