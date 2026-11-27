@@ -1,4 +1,4 @@
-<#
+﻿<#
   프로파일러를 대체 출력명으로 빌드하고(원본 DLL 잠김 회피), InstantiateProbe로
   CLR v4 인스턴스화 가능 여부를 한글 없이 검증한다.
   사용: powershell.exe -NoProfile -ExecutionPolicy Bypass -File build-and-probe.ps1

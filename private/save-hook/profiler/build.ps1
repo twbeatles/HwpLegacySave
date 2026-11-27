@@ -1,4 +1,4 @@
-<#
+﻿<#
   HwpSaveHookProfiler x86 빌드 스크립트 (설계 §8-1).
   - 대상 Hwp.exe가 x86이므로 프로파일러도 x86으로 빌드한다.
   - CLR 프로파일링 헤더(cor.h/corprof.h 등)는 저장소에 동봉하지 않는다.
